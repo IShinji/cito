@@ -10,6 +10,8 @@ pub struct Outcome {
     pub failed: usize,
     pub seconds: f64,
     pub counts: Counts,
+    /// Node IDs pytest reported as FAILED/ERROR (rootdir-relative).
+    pub failed_ids: Vec<String>,
 }
 
 /// Test totals parsed from pytest's summary lines.
@@ -76,16 +78,31 @@ pub fn make_chunks(files: &[FileTests], chunk_size: usize) -> Vec<Vec<String>> {
     chunks
 }
 
-/// Quiet on success, full output on failure. Returns (chunk failed, counts).
-pub fn report_chunk(code: Option<i32>, stdout: &str, stderr: &str) -> (bool, Counts) {
+/// Node IDs from pytest's `-rfE` short summary lines.
+pub fn failed_ids(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line
+                .strip_prefix("FAILED ")
+                .or_else(|| line.strip_prefix("ERROR "))?;
+            Some(rest.split(" - ").next().unwrap_or(rest).trim().to_string())
+        })
+        .collect()
+}
+
+/// Quiet on success, full output on failure.
+pub fn report_chunk(code: Option<i32>, stdout: &str, stderr: &str) -> (bool, Counts, Vec<String>) {
     let counts = summary_counts(stdout);
+    let ids = failed_ids(stdout);
     match code {
         // Exit code 5 means "no tests collected"; harmless here.
-        Some(0) | Some(5) => (false, counts),
+        Some(0) | Some(5) => (false, counts, ids),
         _ => {
             print!("{stdout}");
             eprint!("{stderr}");
-            (true, counts)
+            (true, counts, ids)
         }
     }
 }
@@ -97,6 +114,7 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
     let queue = Mutex::new(VecDeque::from(chunks));
     let failed = Mutex::new(0usize);
     let totals = Mutex::new(Counts::default());
+    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let start = Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..workers.max(1) {
@@ -105,10 +123,10 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
                     break;
                 };
                 let output = Command::new(python)
-                    .args(["-m", "pytest", "-q", "--no-header"])
+                    .args(["-m", "pytest", "-q", "--no-header", "-rfE"])
                     .args(&ids)
                     .output();
-                let (chunk_failed, counts) = match output {
+                let (chunk_failed, counts, ids_failed) = match output {
                     Ok(out) => report_chunk(
                         out.status.code(),
                         &String::from_utf8_lossy(&out.stdout),
@@ -116,10 +134,11 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
                     ),
                     Err(err) => {
                         eprintln!("cito: failed to spawn {python}: {err}");
-                        (true, Counts::default())
+                        (true, Counts::default(), Vec::new())
                     }
                 };
                 totals.lock().expect("totals lock").add(counts);
+                failures.lock().expect("failures lock").extend(ids_failed);
                 if chunk_failed {
                     *failed.lock().expect("failed lock") += 1;
                 }
@@ -129,11 +148,13 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
 
     let failed = *failed.lock().expect("failed lock");
     let counts = *totals.lock().expect("totals lock");
+    let failed_ids = failures.into_inner().expect("failures lock");
     Outcome {
         chunks: total,
         failed,
         seconds: start.elapsed().as_secs_f64(),
         counts,
+        failed_ids,
     }
 }
 

@@ -39,6 +39,16 @@ is a documented gap), 0 extras. This suite exercises pytest's own config
 `python_classes`), decorator aliases, parametrized/autouse fixtures, and
 `pytest_generate_tests` — the most hostile static-analysis target available.
 
+### flask 3.1.3 and rich 15.0.0
+
+Source checkouts at the tags matching the installed wheels, pytest 8.4.2
+(flask 3.1.3's test suite uses a private pytest API removed in pytest 9):
+
+```
+flask: 482 pytest IDs — cito missing 0, extra 0 (14 declared fallbacks)
+rich:  981 pytest IDs — cito missing 0, extra 0 (31 declared fallbacks)
+```
+
 ### Synthetic corpus — 500 files / 11,000 tests
 
 `bench/gen_corpus.py --files 500 --tests 20`:

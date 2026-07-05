@@ -35,10 +35,11 @@ def pytest_ids(target: pathlib.Path, python: str, args: list[str]) -> set[str]:
     ids = set()
     for line in proc.stdout.splitlines():
         line = line.strip()
-        # Node IDs may contain spaces inside parametrize brackets, so accept
-        # any line with a `::` (the exit-code gate above rejects error runs;
-        # warning-section location lines duplicate real IDs harmlessly).
-        if "::" in line and not line.startswith(("=", "warning")):
+        # Node IDs may contain spaces only inside parametrize brackets;
+        # anything with a space before the first `[` is prose (warnings),
+        # not a node ID.
+        head = line.split("[", 1)[0]
+        if "::" in head and " " not in head and not line.startswith("="):
             ids.add(line)
     return ids
 

@@ -45,6 +45,7 @@ pub fn run_warm(files: Vec<FileTests>, workers: usize, chunk_size: usize, python
     let queue = Mutex::new(VecDeque::from(chunks));
     let failed = Mutex::new(0usize);
     let totals = Mutex::new(Counts::default());
+    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let start = Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..workers.max(1) {
@@ -67,25 +68,30 @@ pub fn run_warm(files: Vec<FileTests>, workers: usize, chunk_size: usize, python
                     let Some(ids) = queue.lock().expect("queue lock").pop_front() else {
                         break;
                     };
-                    let mut args = vec!["-q".to_string(), "--no-header".to_string()];
+                    let mut args = vec![
+                        "-q".to_string(),
+                        "--no-header".to_string(),
+                        "-rfE".to_string(),
+                    ];
                     args.extend(ids);
                     let request = serde_json::json!({ "args": args });
                     let mut line = String::new();
                     let ok = writeln!(stdin, "{request}").is_ok()
                         && matches!(stdout.read_line(&mut line), Ok(n) if n > 0);
-                    let (chunk_failed, counts) = if ok {
+                    let (chunk_failed, counts, ids_failed) = if ok {
                         match serde_json::from_str::<Reply>(&line) {
                             Ok(reply) => report_chunk(Some(reply.code), &reply.output, ""),
                             Err(err) => {
                                 eprintln!("cito: bad worker reply: {err}");
-                                (true, Counts::default())
+                                (true, Counts::default(), Vec::new())
                             }
                         }
                     } else {
                         eprintln!("cito: pytest worker died; its chunk is marked failed");
-                        (true, Counts::default())
+                        (true, Counts::default(), Vec::new())
                     };
                     totals.lock().expect("totals lock").add(counts);
+                    failures.lock().expect("failures lock").extend(ids_failed);
                     if chunk_failed {
                         *failed.lock().expect("failed lock") += 1;
                     }
@@ -103,10 +109,12 @@ pub fn run_warm(files: Vec<FileTests>, workers: usize, chunk_size: usize, python
     let leftover = queue.into_inner().expect("queue lock").len();
     let failed = *failed.lock().expect("failed lock") + leftover;
     let counts = *totals.lock().expect("totals lock");
+    let failed_ids = failures.into_inner().expect("failures lock");
     Outcome {
         chunks: total,
         failed,
         seconds: start.elapsed().as_secs_f64(),
         counts,
+        failed_ids,
     }
 }

@@ -31,7 +31,9 @@ And the part that matters more than speed — **the same answers**:
 | suite | pytest IDs | missing | wrong extras |
 |---|---:|---:|---:|
 | pytest's own suite | 4,231 | 1 (a `.txt` doctest; doctest support is a known gap) | 0 |
-| pandas | 197,077 | 675 (0.34%, deep dynamic fixture machinery) | 33 |
+| pandas 3.0.3 | 197,077 | 675 (0.34%, deep dynamic fixture machinery) | 33 |
+| flask 3.1.3 | 482 | 0 | 0 |
+| rich 15.0.0 | 981 | 0 | 0 |
 
 `scripts/diff_collect.py` computes this equivalence on every CI run.
 
@@ -67,6 +69,9 @@ $ cito collect --json             # grouped by file, for tools and agents
 $ cito collect --python .venv/bin/python   # env-aware: honors module-level importorskip
 $ cito run -n 8                   # parallel runner (subprocess workers)
 $ cito run -n 8 --warm            # v0.2 preview: pytest workers stay warm across chunks
+$ cito run tests/test_api.py::TestAuth     # node-ID selectors, like pytest
+$ cito run --lf                   # only the tests that failed last time
+$ cito run --watch                # rerun changed test files on save
 ```
 
 - **Configuration discovery**: `pytest.ini`, `pyproject.toml` (`[tool.pytest]`
@@ -96,6 +101,14 @@ $ cito run -n 8 --warm            # v0.2 preview: pytest workers stay warm acros
   stays inside real CPython, so conftest, fixtures, and plugins keep working.
   Corpus numbers: serial pytest 2.48 s → `cito run -n 8` 1.24 s → `--warm`
   1.20 s.
+- **Scheduling**: failures are recorded in `.cito/lastfailed` (rootdir);
+  every run schedules previously-failed files first, then most-recently
+  modified files — the fastest possible time-to-first-signal. `--lf` runs
+  only the recorded failures (the cache clears as they pass). `--watch`
+  keeps running: save a test file and only that file reruns.
+- **Node-ID selectors**: `cito run tests/a.py::TestX` and
+  `cito collect tests/a.py::test_y` restrict to matching tests, including
+  their parametrizations.
 
 ## The compatibility contract
 

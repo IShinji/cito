@@ -49,6 +49,13 @@ enum Command {
         /// imports pytest once and runs chunks in-process.
         #[arg(long)]
         warm: bool,
+        /// Run only the tests that failed on the previous run.
+        #[arg(long)]
+        lf: bool,
+        /// After running, watch for file changes and rerun affected test
+        /// files (failed-first ordering applies on every rerun).
+        #[arg(long)]
+        watch: bool,
     },
 }
 
@@ -67,6 +74,8 @@ fn main() -> ExitCode {
             chunk,
             python,
             warm,
-        } => cito::commands::run(paths, workers, chunk, python, warm),
+            lf,
+            watch,
+        } => cito::commands::run(paths, workers, chunk, python, warm, lf, watch),
     }
 }

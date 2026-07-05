@@ -13,6 +13,7 @@ categories = ["development-tools::testing", "command-line-utilities"]
 clap = { version = "4", features = ["derive"] }
 globset = "0.4.18"
 ignore = "0.4"
+notify = "8.2.0"
 num_cpus = "1"
 rayon = "1"
 ruff_python_ast = "0.0.3"

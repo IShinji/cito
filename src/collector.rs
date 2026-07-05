@@ -515,6 +515,41 @@ impl<'a> Resolver<'a> {
         ok
     }
 
+    /// Resolve many importorskip names with a single interpreter launch.
+    fn probe_batch(&mut self, names: &std::collections::BTreeSet<String>) {
+        let Some(python) = self.probe_python.clone() else {
+            return;
+        };
+        let pending: Vec<&String> = names
+            .iter()
+            .filter(|n| !self.probe_cache.contains_key(n.as_str()))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        const PROBE: &str = r#"
+import importlib.util, json, sys
+result = {}
+for name in json.loads(sys.argv[1]):
+    try:
+        result[name] = importlib.util.find_spec(name) is not None
+    except Exception:
+        result[name] = False
+print(json.dumps(result))
+"#;
+        let payload = serde_json::to_string(&pending).expect("names serialize");
+        let output = std::process::Command::new(&python)
+            .arg("-c")
+            .arg(PROBE)
+            .arg(&payload)
+            .output();
+        if let Ok(out) = output {
+            if let Ok(map) = serde_json::from_slice::<HashMap<String, bool>>(&out.stdout) {
+                self.probe_cache.extend(map);
+            }
+        }
+    }
+
     fn preload(&mut self, path: PathBuf, module: Option<Module>) {
         self.cache.insert(path, module.map(Rc::new));
     }
@@ -744,6 +779,20 @@ pub fn collect(roots: &[PathBuf], config: &Config, probe_python: Option<&str>) -
     let mut resolver = Resolver::new(config, probe_python.map(str::to_string));
     for (path, module) in files.iter().zip(parsed) {
         resolver.preload(path.clone(), module);
+    }
+
+    // Batch all importorskip probes into one interpreter launch up front.
+    if resolver.probe_python.is_some() {
+        let mut names = std::collections::BTreeSet::new();
+        for path in &files {
+            if let Some(module) = resolver.module(path) {
+                names.extend(module.skip_requires.iter().cloned());
+                for conftest in resolver.conftest_chain(&module.dir) {
+                    names.extend(conftest.skip_requires.iter().cloned());
+                }
+            }
+        }
+        resolver.probe_batch(&names);
     }
 
     files
