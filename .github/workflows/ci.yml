@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  pytest-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+      - run: cargo build --release
+      - name: Differential check on fixtures
+        run: uv run --with pytest scripts/diff_collect.py tests/fixtures/basic
+      - name: Differential check on a generated corpus
+        run: |
+          python3 bench/gen_corpus.py --files 60 --tests 10 --out /tmp/corpus
+          uv run --with pytest scripts/diff_collect.py /tmp/corpus

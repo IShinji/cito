@@ -1,0 +1,24 @@
+[package]
+name = "cito"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A fast, pytest-compatible test collector and runner, written in Rust."
+repository = "https://github.com/IShinji/cito"
+readme = "README.md"
+keywords = ["pytest", "testing", "python", "runner", "cli"]
+categories = ["development-tools::testing", "command-line-utilities"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+num_cpus = "1"
+rayon = "1"
+ruff_python_ast = "0.0.3"
+ruff_python_parser = "0.0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+codegen-units = 1
+lto = true
