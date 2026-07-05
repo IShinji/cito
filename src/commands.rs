@@ -4,7 +4,8 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use crate::config::Config;
-use crate::{collector, runner, warm};
+use crate::warm::WarmPool;
+use crate::{collector, keyword, runner};
 
 // ---------------------------------------------------------------------------
 // Argument handling: paths, testpaths, node-ID selectors
@@ -65,6 +66,22 @@ fn apply_selectors(files: &mut [collector::FileTests], selectors: &[Selector]) {
         }
         file.tests
             .retain(|t| own.iter().any(|s| selector_matches(t, &s.test)));
+    }
+}
+
+/// `-k` filtering against `basename::testid`, pytest-style approximation.
+fn apply_keyword(files: &mut [collector::FileTests], expr: &keyword::KExpr) {
+    for file in files.iter_mut() {
+        let basename = file
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&file.path)
+            .to_string();
+        file.tests.retain(|t| {
+            let candidate = format!("{basename}::{t}").to_lowercase();
+            expr.matches(&candidate)
+        });
     }
 }
 
@@ -279,7 +296,7 @@ struct RunOptions {
     workers: usize,
     chunk: usize,
     python: String,
-    warm: bool,
+    maxfail: usize,
 }
 
 /// Order, run, report, and update the last-failed cache. Returns the outcome.
@@ -287,6 +304,8 @@ fn run_once(
     files: Vec<collector::FileTests>,
     config: &Config,
     options: &RunOptions,
+    pool: Option<&WarmPool>,
+    purge: &[String],
 ) -> runner::Outcome {
     let previous = read_lastfailed(config);
     let files = order_files(files, &previous);
@@ -296,17 +315,28 @@ fn run_once(
         .map(|f| f.path.clone())
         .collect();
     let total: usize = files.iter().map(|f| f.tests.len()).sum();
-    let mode = if options.warm { "warm" } else { "subprocess" };
+    let mode = if pool.is_some() { "warm" } else { "subprocess" };
     eprintln!(
         "cito: running {total} tests across {} {mode} workers",
         options.workers
     );
-    let outcome = if options.warm {
-        warm::run_warm(files, options.workers, options.chunk, &options.python)
-    } else {
-        runner::run(files, options.workers, options.chunk, &options.python)
+    let outcome = match pool {
+        Some(pool) => pool.run(files, options.chunk, options.maxfail, purge),
+        None => runner::run(
+            files,
+            options.workers,
+            options.chunk,
+            &options.python,
+            options.maxfail,
+        ),
     };
     print_summary(&outcome);
+    if outcome.skipped_chunks > 0 {
+        eprintln!(
+            "cito: stopped early (--maxfail): {} chunk(s) not run",
+            outcome.skipped_chunks
+        );
+    }
     write_lastfailed(config, &previous, &rerun_files, &outcome.failed_ids);
     outcome
 }
@@ -320,12 +350,24 @@ pub fn run(
     warm_workers: bool,
     lf: bool,
     watch: bool,
+    maxfail: usize,
+    kexpr: Option<String>,
 ) -> ExitCode {
+    let kexpr = match kexpr.as_deref().map(keyword::parse).transpose() {
+        Ok(expr) => expr,
+        Err(err) => {
+            eprintln!("cito: invalid -k expression: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let Collected {
         mut files,
         roots,
         config,
     } = collect_files(paths, Some(&python));
+    if let Some(expr) = &kexpr {
+        apply_keyword(&mut files, expr);
+    }
     if lf {
         let previous = read_lastfailed(&config);
         if previous.is_empty() {
@@ -338,11 +380,12 @@ pub fn run(
         workers: workers.unwrap_or_else(num_cpus::get),
         chunk,
         python,
-        warm: warm_workers,
+        maxfail,
     };
-    let outcome = run_once(files, &config, &options);
+    let pool = warm_workers.then(|| WarmPool::new(&options.python, options.workers));
+    let outcome = run_once(files, &config, &options, pool.as_ref(), &[]);
     if watch {
-        return watch_loop(&config, &roots, &options);
+        return watch_loop(&config, &roots, &options, pool.as_ref(), kexpr.as_ref());
     }
     if outcome.failed == 0 {
         ExitCode::SUCCESS
@@ -364,7 +407,13 @@ fn note_event(event: Result<notify::Event, notify::Error>, changed: &mut BTreeSe
     }
 }
 
-fn watch_loop(config: &Config, roots: &[PathBuf], options: &RunOptions) -> ExitCode {
+fn watch_loop(
+    config: &Config,
+    roots: &[PathBuf],
+    options: &RunOptions,
+    pool: Option<&WarmPool>,
+    kexpr: Option<&keyword::KExpr>,
+) -> ExitCode {
     use notify::{RecursiveMode, Watcher};
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -389,6 +438,7 @@ fn watch_loop(config: &Config, roots: &[PathBuf], options: &RunOptions) -> ExitC
     }
     eprintln!("cito: watching for changes (Ctrl-C to stop)");
 
+    let mut pending_purge: Vec<String> = Vec::new();
     loop {
         let Ok(first) = rx.recv() else {
             return ExitCode::SUCCESS;
@@ -399,9 +449,10 @@ fn watch_loop(config: &Config, roots: &[PathBuf], options: &RunOptions) -> ExitC
         while let Ok(more) = rx.recv_timeout(Duration::from_millis(250)) {
             note_event(more, &mut changed);
         }
-        let test_files: Vec<PathBuf> = changed
+        let changed_py: Vec<PathBuf> = changed
             .into_iter()
             .filter(|p| p.is_file())
+            .filter(|p| p.extension().is_some_and(|e| e == "py"))
             .filter(|p| {
                 !p.components().any(|c| {
                     matches!(
@@ -410,6 +461,17 @@ fn watch_loop(config: &Config, roots: &[PathBuf], options: &RunOptions) -> ExitC
                     )
                 })
             })
+            .collect();
+        if changed_py.is_empty() {
+            continue;
+        }
+        // Warm workers must drop cached modules for every changed .py file,
+        // not just test files (support modules go stale too).
+        pending_purge.extend(changed_py.iter().map(|p| p.to_string_lossy().into_owned()));
+        pending_purge.sort();
+        pending_purge.dedup();
+        let test_files: Vec<PathBuf> = changed_py
+            .into_iter()
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -423,8 +485,12 @@ fn watch_loop(config: &Config, roots: &[PathBuf], options: &RunOptions) -> ExitC
             "cito: change detected in {} test file(s); rerunning",
             test_files.len()
         );
-        let files = collector::collect(&test_files, config, Some(&options.python));
-        run_once(files, config, options);
+        let mut files = collector::collect(&test_files, config, Some(&options.python));
+        if let Some(expr) = kexpr {
+            apply_keyword(&mut files, expr);
+        }
+        run_once(files, config, options, pool, &pending_purge);
+        pending_purge.clear();
         eprintln!("cito: watching for changes (Ctrl-C to stop)");
     }
 }

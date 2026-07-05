@@ -56,6 +56,16 @@ enum Command {
         /// files (failed-first ordering applies on every rerun).
         #[arg(long)]
         watch: bool,
+        /// Stop after this many test failures (0 = never).
+        #[arg(long, default_value_t = 0)]
+        maxfail: usize,
+        /// Stop after the first failure (same as --maxfail 1).
+        #[arg(short = 'x', conflicts_with = "maxfail")]
+        fail_fast: bool,
+        /// Only run tests matching this keyword expression (substrings
+        /// combined with and/or/not, pytest-style).
+        #[arg(short = 'k')]
+        keyword: Option<String>,
     },
 }
 
@@ -76,6 +86,14 @@ fn main() -> ExitCode {
             warm,
             lf,
             watch,
-        } => cito::commands::run(paths, workers, chunk, python, warm, lf, watch),
+            maxfail,
+            fail_fast,
+            keyword,
+        } => {
+            let maxfail = if fail_fast { 1 } else { maxfail };
+            cito::commands::run(
+                paths, workers, chunk, python, warm, lf, watch, maxfail, keyword,
+            )
+        }
     }
 }

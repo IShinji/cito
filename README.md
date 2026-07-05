@@ -31,7 +31,7 @@ And the part that matters more than speed — **the same answers**:
 | suite | pytest IDs | missing | wrong extras |
 |---|---:|---:|---:|
 | pytest's own suite | 4,231 | 1 (a `.txt` doctest; doctest support is a known gap) | 0 |
-| pandas 3.0.3 | 197,077 | 675 (0.34%, deep dynamic fixture machinery) | 33 |
+| pandas 3.0.3 | 197,077 | 26 (0.013%) | 2 |
 | flask 3.1.3 | 482 | 0 | 0 |
 | rich 15.0.0 | 981 | 0 | 0 |
 
@@ -71,7 +71,9 @@ $ cito run -n 8                   # parallel runner (subprocess workers)
 $ cito run -n 8 --warm            # v0.2 preview: pytest workers stay warm across chunks
 $ cito run tests/test_api.py::TestAuth     # node-ID selectors, like pytest
 $ cito run --lf                   # only the tests that failed last time
-$ cito run --watch                # rerun changed test files on save
+$ cito run --watch --warm         # live loop: warm workers survive across saves
+$ cito run -k "http and not slow" # keyword expressions
+$ cito run -x                     # stop at first failure (--maxfail N)
 ```
 
 - **Configuration discovery**: `pytest.ini`, `pyproject.toml` (`[tool.pytest]`
@@ -126,7 +128,9 @@ Known gaps, tracked honestly:
 
 - doctest collection (`--doctest-modules`, `.txt` doctests)
 - exact expansion where parametrization is computed at runtime (falls back to
-  bare names by design; ~4–8% of IDs in heavily-fixtured repos like pandas)
+  bare names by design; ~4% of IDs in heavily-fixtured repos like pandas),
+  including pytest's duplicate-ID suffixes (True0/True1), which always
+  fall back
 - `pytest_generate_tests`-generated *extra* tests that add new names
 - plugin-driven collection hooks (`conftest.py` `collect_ignore`, custom
   collectors)

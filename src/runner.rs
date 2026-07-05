@@ -8,6 +8,8 @@ use crate::collector::FileTests;
 pub struct Outcome {
     pub chunks: usize,
     pub failed: usize,
+    /// Chunks abandoned because `--maxfail` tripped.
+    pub skipped_chunks: usize,
     pub seconds: f64,
     pub counts: Counts,
     /// Node IDs pytest reported as FAILED/ERROR (rootdir-relative).
@@ -108,11 +110,18 @@ pub fn report_chunk(code: Option<i32>, stdout: &str, stderr: &str) -> (bool, Cou
 }
 
 /// Fan chunks out across fresh `python -m pytest` subprocesses.
-pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &str) -> Outcome {
+pub fn run(
+    files: Vec<FileTests>,
+    workers: usize,
+    chunk_size: usize,
+    python: &str,
+    maxfail: usize,
+) -> Outcome {
     let chunks = make_chunks(&files, chunk_size);
     let total = chunks.len();
     let queue = Mutex::new(VecDeque::from(chunks));
     let failed = Mutex::new(0usize);
+    let skipped = Mutex::new(0usize);
     let totals = Mutex::new(Counts::default());
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let start = Instant::now();
@@ -137,11 +146,19 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
                         (true, Counts::default(), Vec::new())
                     }
                 };
-                totals.lock().expect("totals lock").add(counts);
-                failures.lock().expect("failures lock").extend(ids_failed);
-                if chunk_failed {
-                    *failed.lock().expect("failed lock") += 1;
+                {
+                    let mut totals = totals.lock().expect("totals lock");
+                    totals.add(counts);
+                    if chunk_failed {
+                        *failed.lock().expect("failed lock") += 1;
+                    }
+                    if maxfail > 0 && totals.failed as usize >= maxfail {
+                        let mut queue = queue.lock().expect("queue lock");
+                        *skipped.lock().expect("skipped lock") += queue.len();
+                        queue.clear();
+                    }
                 }
+                failures.lock().expect("failures lock").extend(ids_failed);
             });
         }
     });
@@ -149,9 +166,11 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
     let failed = *failed.lock().expect("failed lock");
     let counts = *totals.lock().expect("totals lock");
     let failed_ids = failures.into_inner().expect("failures lock");
+    let skipped_chunks = *skipped.lock().expect("skipped lock");
     Outcome {
         chunks: total,
         failed,
+        skipped_chunks,
         seconds: start.elapsed().as_secs_f64(),
         counts,
         failed_ids,

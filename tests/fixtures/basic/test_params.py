@@ -56,3 +56,21 @@ class TestClassLevel:
     @pytest.mark.parametrize("n", [1, 2])
     def test_combined(self, n, c):
         assert n and c
+
+
+@pytest.mark.parametrize(
+    "p",
+    [
+        pytest.param(1),
+        pytest.param(2, id="two"),
+        pytest.param(3, marks=pytest.mark.skip),
+    ],
+)
+def test_param_objects(p):
+    assert p
+
+
+@pytest.mark.parametrize("ext", [pytest.param(".xlsx"), pytest.param(".ods")])
+class TestClassParamObjects:
+    def test_with_ext(self, ext):
+        assert ext

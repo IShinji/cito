@@ -19,9 +19,8 @@ cito collect --python <venv> pandas/tests           0.26 s     (36x)
 
 cito's time includes probing `pytest.importorskip` dependencies (pyarrow,
 matplotlib, numba, ...) against the venv. Equivalence: 197,077 pytest IDs;
-675 missing (0.34% — runtime-computed parametrization pandas builds in deep
-fixture machinery), 33 wrong extras; 8,521 IDs matched via cito's declared
-bare-name fallback.
+26 missing (0.013%) and 2 wrong extras — the residue of runtime-computed
+parametrization; ~8,500 IDs matched via cito's declared bare-name fallback.
 
 ### pytest 9.1.1's own test suite — 4,231 tests
 

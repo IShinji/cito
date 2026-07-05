@@ -70,12 +70,16 @@ pub fn from_decorators(decorators: &[ast::Decorator], aliases: &ParamAliases) ->
     let mut sets: Vec<Vec<String>> = Vec::new();
     let mut extra_fixture_requests = Vec::new();
     let mut poisoned = false;
+    let mut parametrized = false;
     for decorator in decorators {
         match &decorator.expression {
-            Expr::Call(call) if is_parametrize(&call.func) => match parametrize_pieces(call) {
-                Some(pieces) => sets.push(pieces),
-                None => poisoned = true,
-            },
+            Expr::Call(call) if is_parametrize(&call.func) => {
+                parametrized = true;
+                match parametrize_pieces(call) {
+                    Some(pieces) => sets.push(pieces),
+                    None => poisoned = true,
+                }
+            }
             Expr::Call(call) if is_usefixtures(&call.func) => {
                 for arg in call.arguments.args.iter() {
                     match string_value(arg) {
@@ -85,6 +89,7 @@ pub fn from_decorators(decorators: &[ast::Decorator], aliases: &ParamAliases) ->
                 }
             }
             Expr::Name(name) if aliases.contains_key(name.id.as_str()) => {
+                parametrized = true;
                 match &aliases[name.id.as_str()] {
                     Some(pieces) => sets.push(pieces.clone()),
                     None => poisoned = true,
@@ -97,10 +102,12 @@ pub fn from_decorators(decorators: &[ast::Decorator], aliases: &ParamAliases) ->
             }
         }
     }
-    let expansion = if sets.is_empty() {
-        Expansion::None
-    } else if poisoned {
+    // A test that IS parametrized but whose IDs we cannot fully resolve must
+    // fall back to the bare name — never expand a partial/wrong set.
+    let expansion = if poisoned && parametrized {
         Expansion::Fallback
+    } else if sets.is_empty() {
+        Expansion::None
     } else {
         // Bottom decorator = last in source order = first piece, fastest loop.
         sets.reverse();
@@ -118,7 +125,6 @@ pub fn from_decorators(decorators: &[ast::Decorator], aliases: &ParamAliases) ->
             }
             suffixes = next;
         }
-        disambiguate(&mut suffixes);
         Expansion::Params(suffixes)
     };
     DecoratorInfo {
@@ -177,24 +183,6 @@ fn is_usefixtures(func: &Expr) -> bool {
         Expr::Attribute(attr) => attr.attr.as_str() == "usefixtures",
         Expr::Name(name) => name.id.as_str() == "usefixtures",
         _ => false,
-    }
-}
-
-/// pytest appends 0, 1, ... to *every* member of a duplicated ID group.
-fn disambiguate(suffixes: &mut [String]) {
-    use std::collections::HashMap;
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for s in suffixes.iter() {
-        *counts.entry(s.clone()).or_default() += 1;
-    }
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    for s in suffixes.iter_mut() {
-        if counts[s.as_str()] > 1 {
-            let n = seen.entry(s.clone()).or_default();
-            let suffixed = format!("{s}{n}");
-            *n += 1;
-            *s = suffixed;
-        }
     }
 }
 
@@ -293,24 +281,70 @@ fn parametrize_pieces(call: &ast::ExprCall) -> Option<Vec<String>> {
     }
 
     if let Some(ids) = explicit_ids(call) {
-        return (ids.len() == values.len()).then_some(ids);
+        let mut seen = std::collections::HashSet::new();
+        let unique = ids.iter().all(|p| seen.insert(p.clone()));
+        return (unique && ids.len() == values.len()).then_some(ids);
     }
 
     let mut pieces = Vec::with_capacity(values.len());
     for value in values {
-        let rendered = if n_args == 1 {
-            render_scalar(value)?
-        } else {
-            let parts = elements(value)?;
-            if parts.len() != n_args {
-                return None;
-            }
-            let rendered: Option<Vec<String>> = parts.iter().map(render_scalar).collect();
-            rendered?.join("-")
-        };
-        pieces.push(rendered);
+        pieces.push(piece_for_element(value, n_args)?);
+    }
+    // pytest disambiguates duplicate values with per-occurrence suffixes
+    // (True0/True1) computed per parameter set; rather than replicate that
+    // exactly, fall back when a set repeats a rendered piece.
+    let mut seen = std::collections::HashSet::new();
+    if !pieces.iter().all(|p| seen.insert(p.clone())) {
+        return None;
     }
     Some(pieces)
+}
+
+/// Render one argvalues element, including `pytest.param(...)` wrappers:
+/// `id=` wins, `marks=` is ID-neutral, any other keyword is unknown.
+fn piece_for_element(expr: &Expr, n_args: usize) -> Option<String> {
+    if let Expr::Call(call) = expr {
+        if is_param_call(&call.func) {
+            let mut explicit_id = None;
+            for keyword in call.arguments.keywords.iter() {
+                match keyword.arg.as_ref().map(|a| a.as_str()) {
+                    Some("id") => explicit_id = Some(&keyword.value),
+                    Some("marks") => {}
+                    _ => return None,
+                }
+            }
+            if let Some(value) = explicit_id {
+                return match value {
+                    Expr::StringLiteral(s) => safe_string(s.value.to_str()),
+                    _ => None,
+                };
+            }
+            let args = &call.arguments.args;
+            if args.len() != n_args {
+                return None;
+            }
+            let rendered: Option<Vec<String>> = args.iter().map(render_scalar).collect();
+            return Some(rendered?.join("-"));
+        }
+    }
+    if n_args == 1 {
+        render_scalar(expr)
+    } else {
+        let parts = elements(expr)?;
+        if parts.len() != n_args {
+            return None;
+        }
+        let rendered: Option<Vec<String>> = parts.iter().map(render_scalar).collect();
+        Some(rendered?.join("-"))
+    }
+}
+
+fn is_param_call(func: &Expr) -> bool {
+    match func {
+        Expr::Attribute(attr) => attr.attr.as_str() == "param",
+        Expr::Name(name) => name.id.as_str() == "param",
+        _ => false,
+    }
 }
 
 fn argnames_count(expr: &Expr) -> Option<usize> {

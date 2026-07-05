@@ -19,12 +19,17 @@ Initial release.
 - `--python` probe for module-level `pytest.importorskip` requirements.
 - `cito run`: parallel execution across pytest subprocesses; `--warm` keeps
   workers alive across chunks (`pytest.main()` in-process).
+- `-k` keyword expressions (and/or/not), `-x`/`--maxfail` fail-fast with
+  chunk skipping, `pytest.param(...)` ID rendering (including `id=`),
+  re-export chasing for base classes (`base/__init__.py` patterns), warm
+  worker pool persists across `--watch` iterations with stale-module
+  purging for every changed `.py` file.
 - Scheduling: failed-first + recently-modified-first ordering by default,
   `.cito/lastfailed` cache with automatic clearing, `--lf` (only last
   failures), `--watch` (rerun changed test files on save), node-ID selector
   arguments (`path::Class::test`), one-shot batched importorskip probing.
 - Differential parity, checked in CI: pytest 9.1.1's own suite 4,231 IDs →
-  1 known gap (doctest), 0 extras; pandas 3.0.3 197,077 IDs → 0.34% missing;
+  1 known gap (doctest), 0 extras; pandas 3.0.3 197,077 IDs → 26 missing / 2 extra (0.014%);
   flask 3.1.3 (482 IDs) and rich 15.0.0 (981 IDs) → exact.
 - Collection speed: pandas 9.48 s → 0.26 s (36x); pytest's repo 0.62 s →
   <0.01 s; 11k-test corpus 0.70 s → 0.01 s.

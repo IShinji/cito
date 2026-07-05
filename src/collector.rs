@@ -61,6 +61,7 @@ struct Class {
     bases: Vec<String>,
     items: Vec<ClassItem>,
     fixtures: HashMap<String, Fixture>,
+    usefixtures: Vec<String>,
     expansion: Expansion,
     has_ctor: bool,
 }
@@ -71,7 +72,7 @@ enum TopItem {
     Class(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Fixture {
     parametrized: bool,
     autouse: bool,
@@ -430,6 +431,7 @@ fn build_class(class: &ast::StmtClassDef, aliases: &params::ParamAliases) -> Cla
         bases,
         items,
         fixtures,
+        usefixtures: class_info.extra_fixture_requests,
         expansion: class_info.expansion,
         has_ctor,
     }
@@ -620,6 +622,42 @@ print(json.dumps(result))
         }
     }
 
+    /// Chase `name` through re-exports (`from .impl import X` in an
+    /// __init__.py, star re-exports) until the defining module is found.
+    fn resolve_symbol(
+        &mut self,
+        mut module: Rc<Module>,
+        mut name: String,
+    ) -> Option<(Rc<Module>, String)> {
+        for _ in 0..8 {
+            if module.classes.contains_key(&name) {
+                return Some((module, name));
+            }
+            match module.imports.get(&name).cloned() {
+                Some(Import::From(mref, orig)) => {
+                    if is_unittest_ref(&mref, &orig) {
+                        return None;
+                    }
+                    let next = self.resolve_ref(&mref, &module.dir.clone())?;
+                    module = next;
+                    name = orig;
+                }
+                Some(Import::Module(_)) => return None,
+                None => {
+                    for star in module.star_imports.clone() {
+                        if let Some(target) = self.resolve_ref(&star, &module.dir) {
+                            if target.classes.contains_key(&name) {
+                                return Some((target, name));
+                            }
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
     fn resolve_base(&mut self, module: &Rc<Module>, text: &str) -> BaseTarget {
         let segments: Vec<&str> = text.split('.').collect();
         if segments.len() == 1 {
@@ -629,8 +667,11 @@ print(json.dumps(result))
                     if is_unittest_ref(&mref, &orig) {
                         return BaseTarget::Unittest;
                     }
-                    match self.resolve_ref(&mref, &module.dir) {
-                        Some(target) => BaseTarget::Local(target, orig),
+                    match self
+                        .resolve_ref(&mref, &module.dir)
+                        .and_then(|target| self.resolve_symbol(target, orig.clone()))
+                    {
+                        Some((target, name)) => BaseTarget::Local(target, name),
                         None => BaseTarget::Unknown,
                     }
                 }
@@ -674,8 +715,11 @@ print(json.dumps(result))
             if is_unittest_ref(&mref, last) {
                 return BaseTarget::Unittest;
             }
-            match self.resolve_ref(&mref, &module.dir) {
-                Some(target) => BaseTarget::Local(target, last.to_string()),
+            match self
+                .resolve_ref(&mref, &module.dir)
+                .and_then(|target| self.resolve_symbol(target, last.to_string()))
+            {
+                Some((target, name)) => BaseTarget::Local(target, name),
                 None => BaseTarget::Unknown,
             }
         }
@@ -692,9 +736,10 @@ print(json.dumps(result))
         class: &Class,
         key: (PathBuf, String),
         visited: &mut HashSet<(PathBuf, String)>,
-    ) -> (Vec<TestDef>, bool, bool) {
+    ) -> (Vec<TestDef>, bool, bool, HashMap<String, Fixture>) {
         visited.insert(key);
         let mut methods: Vec<TestDef> = Vec::new();
+        let mut chain_fixtures: HashMap<String, Fixture> = class.fixtures.clone();
         let mut seen: HashSet<String> = HashSet::new();
         for item in &class.items {
             if let ClassItem::Method(def) = item {
@@ -729,10 +774,13 @@ print(json.dumps(result))
                     };
                     base_params |= target_class.expansion != Expansion::None
                         || has_autouse_params(&target_class.fixtures);
-                    let (inherited, base_ut, base_bp) =
+                    let (inherited, base_ut, base_bp, base_fixtures) =
                         self.resolve_class(&target_mod, target_class, key, visited);
                     unittest |= base_ut;
                     base_params |= base_bp;
+                    for (name, fixture) in base_fixtures {
+                        chain_fixtures.entry(name).or_insert(fixture);
+                    }
                     for def in inherited {
                         if seen.insert(def.name.clone()) {
                             methods.push(def);
@@ -742,7 +790,7 @@ print(json.dumps(result))
                 BaseTarget::Unknown => {}
             }
         }
-        (methods, unittest, base_params)
+        (methods, unittest, base_params, chain_fixtures)
     }
 }
 
@@ -902,10 +950,11 @@ fn emit_class(
 ) {
     let mut visited = HashSet::new();
     let key = (module.path.clone(), name.to_string());
-    let (methods, unittest, base_params) = resolver.resolve_class(module, class, key, &mut visited);
-    // The class's own (or inherited) parametrized autouse fixtures poison
-    // exact expansion for all of its methods.
-    let poisoned = poisoned || base_params || has_autouse_params(&class.fixtures);
+    let (methods, unittest, base_params, chain_fixtures) =
+        resolver.resolve_class(module, class, key, &mut visited);
+    // The class chain's parametrized autouse fixtures poison exact
+    // expansion for all of its methods.
+    let poisoned = poisoned || base_params || has_autouse_params(&chain_fixtures);
 
     let collectable = unittest || (resolver.config.class_matches(name) && !class.has_ctor);
     if !collectable {
@@ -927,17 +976,16 @@ fn emit_class(
         if !matches {
             continue;
         }
-        // The leaf module's fixture visibility applies to inherited methods.
-        let expansion = if def.expansion != Expansion::None
-            && requests_parametrized_fixture(contexts, &[&class.fixtures], def)
-        {
-            Expansion::Fallback
-        } else {
-            def.expansion.clone()
-        };
-        let mut combined = Expansion::combine(&class_expansion, &expansion);
-        if poisoned && matches!(combined, Expansion::Params(_)) {
-            combined = Expansion::Fallback;
+        // Any exact expansion — the method's own or one applied by the
+        // class — is invalid if the test requests a parametrized fixture
+        // (leaf-module visibility applies to inherited methods too).
+        let mut combined = Expansion::combine(&class_expansion, &def.expansion);
+        if matches!(combined, Expansion::Params(_)) {
+            let mut request = def.clone();
+            request.args.extend(class.usefixtures.iter().cloned());
+            if poisoned || requests_parametrized_fixture(contexts, &[&chain_fixtures], &request) {
+                combined = Expansion::Fallback;
+            }
         }
         for id in combined.apply(&def.name) {
             out.push(format!("{}::{}", stack.join("::"), id));
