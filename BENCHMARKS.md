@@ -1,0 +1,81 @@
+# Benchmarks
+
+Environment: Apple M4 Max (16 cores), macOS, Python 3.14.6, cito v0.1
+(release build). All timings `/usr/bin/time -p`, best of repeated runs with
+warm filesystem cache. Collection equivalence is checked with
+`scripts/diff_collect.py` in the same session as every timing.
+
+## Collection
+
+### pandas 3.0.3 — 197,077 tests
+
+Installed wheel (`uv pip install pandas hypothesis "pytest==8.4.2"`), run
+from `site-packages` against `pandas/tests`:
+
+```
+python -m pytest --collect-only -q pandas/tests     9.48 s
+cito collect --python <venv> pandas/tests           0.26 s     (36x)
+```
+
+cito's time includes probing `pytest.importorskip` dependencies (pyarrow,
+matplotlib, numba, ...) against the venv. Equivalence: 197,077 pytest IDs;
+675 missing (0.34% — runtime-computed parametrization pandas builds in deep
+fixture machinery), 33 wrong extras; 8,521 IDs matched via cito's declared
+bare-name fallback.
+
+### pytest 9.1.1's own test suite — 4,231 tests
+
+Clone of `pytest-dev/pytest` at tag `9.1.1`, deps installed for collection
+(`xmlschema pygments attrs mock setuptools hypothesis`):
+
+```
+python -m pytest --collect-only -q                  0.62 s
+cito collect --python <venv>                        <0.01 s    (>100x)
+```
+
+Equivalence: 1 missing out of 4,231 (a `.txt` doctest — doctest collection
+is a documented gap), 0 extras. This suite exercises pytest's own config
+(`[tool.pytest]` in pyproject, path-pattern `python_files`, prefix
+`python_classes`), decorator aliases, parametrized/autouse fixtures, and
+`pytest_generate_tests` — the most hostile static-analysis target available.
+
+### Synthetic corpus — 500 files / 11,000 tests
+
+`bench/gen_corpus.py --files 500 --tests 20`:
+
+```
+python -m pytest --collect-only -q    3.17 s cold / 0.70 s warm
+cito collect                          0.28 s cold / 0.01 s warm   (70x warm)
+```
+
+Equivalence: exact (11,000 = 11,000).
+
+## Execution (preview)
+
+Same corpus, trivial test bodies (worst case for parallelism overhead):
+
+```
+python -m pytest -q                   2.48 s
+cito run -n 8                         1.24 s
+cito run -n 8 --warm                  1.20 s
+```
+
+`--warm` keeps pytest workers alive across chunks (one `import pytest` per
+worker instead of one per chunk). Its advantage grows with conftest import
+cost; on this corpus imports are trivial. The v0.2 daemon design targets the
+remaining per-chunk overhead (rootdir/config re-computation, module imports).
+
+## Reproduce
+
+```console
+$ bench/bench_collect.sh                                  # corpus
+$ git clone --depth 1 --branch 9.1.1 https://github.com/pytest-dev/pytest /tmp/pytest-repo
+$ uv venv /tmp/ptv && uv pip install --python /tmp/ptv/bin/python \
+    "pytest==9.1.1" xmlschema pygments attrs mock setuptools hypothesis
+$ python3 scripts/diff_collect.py /tmp/pytest-repo --python /tmp/ptv/bin/python \
+    --ignore-missing test_doctest.txt
+$ uv venv /tmp/pdv && uv pip install --python /tmp/pdv/bin/python \
+    "pytest==8.4.2" pandas hypothesis
+$ SP=$(/tmp/pdv/bin/python -c "import pandas, pathlib; print(pathlib.Path(pandas.__file__).parent.parent)")
+$ python3 scripts/diff_collect.py "$SP" pandas/tests --python /tmp/pdv/bin/python
+```

@@ -28,8 +28,18 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: cargo build --release
       - name: Differential check on fixtures
-        run: uv run --with pytest scripts/diff_collect.py tests/fixtures/basic
+        run: |
+          uv run --with pytest scripts/diff_collect.py tests/fixtures/basic
+          uv run --with pytest scripts/diff_collect.py tests/fixtures/configured
       - name: Differential check on a generated corpus
         run: |
           python3 bench/gen_corpus.py --files 60 --tests 10 --out /tmp/corpus
           uv run --with pytest scripts/diff_collect.py /tmp/corpus
+      - name: Differential check against pytest's own test suite
+        run: |
+          git clone --depth 1 --branch 9.1.1 https://github.com/pytest-dev/pytest /tmp/pytest-repo
+          uv venv /tmp/ptv
+          uv pip install --python /tmp/ptv/bin/python "pytest==9.1.1" \
+            xmlschema pygments attrs mock setuptools hypothesis
+          python3 scripts/diff_collect.py /tmp/pytest-repo \
+            --python /tmp/ptv/bin/python --ignore-missing test_doctest.txt

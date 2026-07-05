@@ -26,6 +26,11 @@ enum Command {
         /// Print only the number of collected tests.
         #[arg(long, conflicts_with = "json")]
         count: bool,
+        /// Probe this Python for module-level `pytest.importorskip(...)`
+        /// dependencies, dropping modules pytest would skip in that
+        /// environment. Without it, collection is fully static.
+        #[arg(long)]
+        python: Option<String>,
     },
     /// Run tests by fanning collected node IDs out across pytest processes (experimental).
     Run {
@@ -40,18 +45,28 @@ enum Command {
         /// Python executable used to run pytest.
         #[arg(long, default_value = "python3")]
         python: String,
+        /// Keep pytest workers warm across chunks (v0.2 preview): each worker
+        /// imports pytest once and runs chunks in-process.
+        #[arg(long)]
+        warm: bool,
     },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Collect { paths, json, count } => cito::commands::collect(paths, json, count),
+        Command::Collect {
+            paths,
+            json,
+            count,
+            python,
+        } => cito::commands::collect(paths, json, count, python),
         Command::Run {
             paths,
             workers,
             chunk,
             python,
-        } => cito::commands::run(paths, workers, chunk, python),
+            warm,
+        } => cito::commands::run(paths, workers, chunk, python, warm),
     }
 }

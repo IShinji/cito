@@ -2,98 +2,120 @@
 
 **A fast, pytest-compatible test collector and runner, written in Rust.**
 
-*cito* (Latin: "quickly" — the word doctors still write on urgent orders) is an
-experiment in making the pytest inner loop fast, the way
-[Ruff](https://github.com/astral-sh/ruff) and [uv](https://github.com/astral-sh/uv)
-did for linting and packaging. It parses your test files with ruff's parser and
-discovers tests in milliseconds, not seconds.
+*cito* (Latin: "quickly" — the word doctors still write on urgent orders) makes
+the pytest inner loop fast, the way [Ruff](https://github.com/astral-sh/ruff)
+and [uv](https://github.com/astral-sh/uv) did for linting and packaging. It
+discovers your tests by parsing them with ruff's parser — in milliseconds, not
+seconds — and verifies against real pytest that it finds the same node IDs.
 
-> **Status: v0.0.x.** `cito collect` works and is fast. `cito run` is an
-> experimental scaffold. Nothing here is production-ready yet — the
-> compatibility contract below is the plan for getting there.
-
-## Why
-
-- pytest is the default test runner of the Python world (~a billion downloads a
-  month), and on large suites *collection alone* can take tens of seconds to
-  minutes ([pytest#5516](https://github.com/pytest-dev/pytest/issues/5516)).
-  Every `pytest -k one_test` pays that tax before a single test runs.
-- The tax is no longer only human: coding agents run the test suite dozens of
-  times per task. Suite latency is agent-loop latency.
-- Ruff and uv proved the recipe: reimplement the hot path in Rust, treat the
-  existing ecosystem's behavior as a compatibility contract, and win by 10–100x.
+> **Status: v0.1.** Collection is real, fast, and differential-tested against
+> pytest's own test suite and pandas'. The parallel runner (`cito run`,
+> `--warm`) is a working preview. Not yet production-ready; the compatibility
+> contract below is the plan for getting there.
 
 ## Benchmarks
 
-Synthetic corpus: 500 files, 11,000 tests. Apple M4 Max, Python 3.14.6,
-pytest 9.1.1. Reproduce with `bench/bench_collect.sh`.
+Collection, wall time (Apple M4 Max, Python 3.14, warm cache; see
+[BENCHMARKS.md](BENCHMARKS.md) to reproduce):
 
-| collection | cold cache | warm cache |
-|---|---:|---:|
-| `pytest --collect-only -q` | 3.17 s | 0.70 s |
-| `cito collect` | 0.28 s | **0.01 s** |
+| suite | tests | `pytest --collect-only -q` | `cito collect` | speedup |
+|---|---:|---:|---:|---:|
+| pandas 3.0.3 (installed) | 197,077 | 9.48 s | **0.26 s** | 36x |
+| pytest 9.1.1 (own suite) | 4,231 | 0.62 s | **&lt;0.01 s** | &gt;100x |
+| synthetic corpus | 11,000 | 0.70 s | **0.01 s** | 70x |
 
-Same corpus, both tools collect exactly the same 11,000 node IDs
-(`scripts/diff_collect.py` verifies this in CI).
+And the part that matters more than speed — **the same answers**:
 
-Honest caveats: a synthetic corpus has no heavy `conftest.py` imports — real
-repositories are usually *worse* for pytest (and no better for cito, which
-doesn't import anything). The numbers that matter are Django/pandas/
-home-assistant scale, and that's the next milestone. The experimental
-`cito run -n 8` currently gives ~1.6x on this corpus (2.57 s → 1.60 s) because
-each chunk still pays pytest startup — eliminating that tax is the v0.2 warm
-worker design below.
+| suite | pytest IDs | missing | wrong extras |
+|---|---:|---:|---:|
+| pytest's own suite | 4,231 | 1 (a `.txt` doctest; doctest support is a known gap) | 0 |
+| pandas | 197,077 | 675 (0.34%, deep dynamic fixture machinery) | 33 |
+
+`scripts/diff_collect.py` computes this equivalence on every CI run.
+
+## Why
+
+- pytest is the default test runner of the Python world (~a billion downloads
+  a month), and on large suites *collection alone* takes seconds to minutes
+  ([pytest#5516](https://github.com/pytest-dev/pytest/issues/5516)). Every
+  `pytest -k one_test` pays that tax before a single test runs.
+- The tax is no longer only human: coding agents run the suite dozens of times
+  per task. Suite latency is agent-loop latency.
+- Ruff and uv proved the recipe: reimplement the hot path in Rust, treat the
+  existing ecosystem's behavior as a compatibility contract, win by 10–100x.
 
 ## What works today
 
 ```console
-$ cito collect                # pytest-convention discovery, in parallel
+$ cito collect                    # pytest-convention discovery, in parallel
 tests/test_api.py::test_get
-tests/test_api.py::TestAuth::test_login
-$ cito collect --count        # just the number
-$ cito collect --json         # grouped by file, for tools and agents
-$ cito run -n 8               # experimental: fan node IDs out across pytest processes
+tests/test_api.py::TestAuth::test_login[admin]
+$ cito collect --count            # just the number
+$ cito collect --json             # grouped by file, for tools and agents
+$ cito collect --python .venv/bin/python   # env-aware: honors module-level importorskip
+$ cito run -n 8                   # parallel runner (subprocess workers)
+$ cito run -n 8 --warm            # v0.2 preview: pytest workers stay warm across chunks
 ```
 
-- `cito collect [PATHS]` walks the tree with pytest's default conventions
-  (`test_*.py` / `*_test.py` files; `Test*` classes without `__init__`,
-  recursively; `test*` functions and methods), parses with
-  `ruff_python_parser`, in parallel with rayon, and prints pytest-style node
-  IDs in definition order.
-- `cito run [PATHS] [-n N] [--chunk K] [--python PY]` partitions collected
-  node IDs (whole files stay together) across N pytest worker processes.
-  Experimental: fixture scoping across chunks behaves like
-  `pytest-xdist --dist loadfile`, and reporting is crude.
+- **Configuration discovery**: `pytest.ini`, `pyproject.toml` (`[tool.pytest]`
+  and `[tool.pytest.ini_options]`), `tox.ini`, `setup.cfg`; rootdir inference;
+  `testpaths`, `python_files` / `python_classes` / `python_functions` (prefix
+  and glob forms, including path patterns like `testing/python/*.py`),
+  `norecursedirs`, virtualenv detection.
+- **Collection semantics**: definition-order node IDs; nested classes;
+  `__init__`/`__new__` exclusion; **cross-module base-class resolution** (the
+  pandas `TestMaskedArrays(base.ExtensionTests)` pattern — resolved through
+  imports, relative imports, star-imports, and Python's package-root sys.path
+  semantics); `unittest.TestCase` subclasses collected regardless of naming.
+- **Parametrize expansion with an honesty contract**: literal scalars, tuples,
+  stacked decorators (cartesian, pytest's piece order), `ids=`, class-level
+  parametrize, module-level parametrize aliases, and duplicate-ID
+  disambiguation are expanded *exactly*. Anything static analysis cannot
+  prove — floats, computed values, `indirect=`, parametrized or autouse
+  fixtures, `pytest_generate_tests` in scope, unknown decorators — falls back
+  to the bare test name rather than risking a wrong ID. A bare name is always
+  a valid pytest selector for all of its parametrizations.
+- **Environment awareness (opt-in)**: `--python PY` probes module-level
+  `pytest.importorskip("...")` requirements and drops modules pytest would
+  skip in that environment. Without it, collection is fully static.
+- **Runner preview**: `cito run` partitions node IDs (whole files together,
+  like `xdist --dist loadfile`) across N pytest subprocesses; `--warm` keeps
+  workers alive and runs chunks via `pytest.main()` in-process — execution
+  stays inside real CPython, so conftest, fixtures, and plugins keep working.
+  Corpus numbers: serial pytest 2.48 s → `cito run -n 8` 1.24 s → `--warm`
+  1.20 s.
 
 ## The compatibility contract
 
-pytest's node IDs are the interface. `scripts/diff_collect.py` collects the
-same tree with both tools and fails on any difference (parametrized IDs are
-normalized away for now). CI runs it on every commit; the goal is to grow the
-corpus it runs against until it includes real-world projects.
+pytest's node IDs are the interface:
 
-Known gaps, in roadmap order:
+1. A cito ID with a `[...]` suffix must match a pytest ID **exactly**.
+2. A bare cito ID stands for pytest's parametrized IDs of the same base —
+   cito's declared fallback wherever static analysis cannot be sure.
 
-- [ ] parametrize expansion (`test_x[3-true]`)
-- [ ] `python_files` / `python_classes` / `python_functions` ini overrides
-- [ ] rootdir/ini discovery (`pyproject.toml`, `pytest.ini`, `setup.cfg`, `tox.ini`)
-- [ ] `testpaths`, `norecursedirs` overrides, `__init__.py` package semantics
-- [ ] dynamically generated tests (`pytest_generate_tests`) — requires the
-      worker protocol below
+`scripts/diff_collect.py` enforces both directions on every commit against
+the fixture trees and a generated corpus, and is run manually against real
+repositories (pytest, pandas) before releases.
+
+Known gaps, tracked honestly:
+
+- doctest collection (`--doctest-modules`, `.txt` doctests)
+- exact expansion where parametrization is computed at runtime (falls back to
+  bare names by design; ~4–8% of IDs in heavily-fixtured repos like pandas)
+- `pytest_generate_tests`-generated *extra* tests that add new names
+- plugin-driven collection hooks (`conftest.py` `collect_ignore`, custom
+  collectors)
 
 ## Architecture (where this is going)
 
-1. **v0.1 — collection parity + speed** (you are here): Rust discovery + AST
-   collection, differential-tested against pytest.
-2. **v0.2 — warm workers**: a daemon holding pre-imported CPython workers.
-   *Execution stays inside real CPython*, so fixtures, conftest, and plugins
-   keep working — Rust owns discovery, scheduling, caching, and reporting.
-   (The cargo-nextest model, adapted to Python's import cost.)
+1. **v0.1 — collection parity + speed** (you are here).
+2. **v0.2 — warm workers, properly**: a daemon holding pre-imported CPython
+   workers; Rust owns discovery, scheduling, caching, and reporting. First
+   cut ships behind `cito run --warm`.
 3. **v0.3 — scheduling wins**: failed-first, changed-first (AST diff),
    `--watch`, machine-readable output for agents and CI.
 4. **Plugin compatibility matrix**: explicit, tested support for the top-20
-   pytest plugins (xdist, cov, asyncio, django, hypothesis, mock, ...),
-   tracked in a public table.
+   pytest plugins (xdist, cov, asyncio, django, hypothesis, mock, ...).
 
 ## Non-goals
 
@@ -104,10 +126,10 @@ Known gaps, in roadmap order:
 ## Development
 
 ```console
-$ cargo test                                          # unit + integration tests
+$ cargo test                                   # unit + integration tests
 $ cargo build --release
 $ uv run --with pytest scripts/diff_collect.py tests/fixtures/basic
-$ bench/bench_collect.sh                              # reproduce the numbers above
+$ bench/bench_collect.sh                       # reproduce the corpus numbers
 ```
 
 ## License

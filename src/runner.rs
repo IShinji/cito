@@ -11,10 +11,10 @@ pub struct Outcome {
     pub seconds: f64,
 }
 
-/// Experimental: partition node IDs into chunks (whole files stay together,
-/// so fixture scoping behaves like `pytest-xdist --dist loadfile`) and fan
-/// them out across `workers` pytest processes.
-pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &str) -> Outcome {
+/// Partition node IDs into chunks, keeping whole files together so fixture
+/// scoping behaves like `pytest-xdist --dist loadfile`. IDs are built from
+/// absolute paths so workers resolve them from any cwd.
+pub fn make_chunks(files: &[FileTests], chunk_size: usize) -> Vec<Vec<String>> {
     let mut chunks: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
     for file in files {
@@ -24,12 +24,37 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
         if !current.is_empty() && current.len() + file.tests.len() > chunk_size {
             chunks.push(std::mem::take(&mut current));
         }
-        current.extend(file.tests.iter().map(|t| format!("{}::{}", file.path, t)));
+        let path = file.abs_path.to_string_lossy();
+        current.extend(file.tests.iter().map(|t| format!("{path}::{t}")));
     }
     if !current.is_empty() {
         chunks.push(current);
     }
+    chunks
+}
 
+/// Print the pytest summary line for a passing chunk, or the full output for
+/// a failing one. Returns whether the chunk counts as failed.
+pub fn report_chunk(code: Option<i32>, stdout: &str, stderr: &str) -> bool {
+    match code {
+        // Exit code 5 means "no tests collected"; harmless here.
+        Some(0) | Some(5) => {
+            if let Some(summary) = stdout.lines().rev().find(|l| !l.trim().is_empty()) {
+                println!("{}", summary.trim());
+            }
+            false
+        }
+        _ => {
+            print!("{stdout}");
+            eprint!("{stderr}");
+            true
+        }
+    }
+}
+
+/// Fan chunks out across fresh `python -m pytest` subprocesses.
+pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &str) -> Outcome {
+    let chunks = make_chunks(&files, chunk_size);
     let total = chunks.len();
     let queue = Mutex::new(VecDeque::from(chunks));
     let failed = Mutex::new(0usize);
@@ -44,23 +69,19 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
                     .args(["-m", "pytest", "-q", "--no-header"])
                     .args(&ids)
                     .output();
-                match output {
-                    // Exit code 5 means "no tests collected"; harmless here.
-                    Ok(out) if out.status.success() || out.status.code() == Some(5) => {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        if let Some(summary) = stdout.lines().rev().find(|l| !l.trim().is_empty()) {
-                            println!("{}", summary.trim());
-                        }
-                    }
-                    Ok(out) => {
-                        *failed.lock().expect("failed lock") += 1;
-                        print!("{}", String::from_utf8_lossy(&out.stdout));
-                        eprint!("{}", String::from_utf8_lossy(&out.stderr));
-                    }
+                let chunk_failed = match output {
+                    Ok(out) => report_chunk(
+                        out.status.code(),
+                        &String::from_utf8_lossy(&out.stdout),
+                        &String::from_utf8_lossy(&out.stderr),
+                    ),
                     Err(err) => {
-                        *failed.lock().expect("failed lock") += 1;
                         eprintln!("cito: failed to spawn {python}: {err}");
+                        true
                     }
+                };
+                if chunk_failed {
+                    *failed.lock().expect("failed lock") += 1;
                 }
             });
         }
