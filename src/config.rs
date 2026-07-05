@@ -105,6 +105,12 @@ impl Config {
                 return Config::build(dir.to_path_buf(), Some(source), options);
             }
         }
+        // No configfile anywhere: pytest falls back to a setup.py anchor.
+        for dir in start.ancestors() {
+            if dir.join("setup.py").is_file() {
+                return Config::build(dir.to_path_buf(), None, HashMap::new());
+            }
+        }
         Config::build(start, None, HashMap::new())
     }
 
@@ -177,10 +183,12 @@ fn config_in(dir: &Path) -> Option<(PathBuf, HashMap<String, Vec<String>>)> {
     }
     let pyproject = dir.join("pyproject.toml");
     if pyproject.is_file() {
+        // Like pytest.ini, any pyproject.toml counts as a configfile and
+        // rootdir anchor (pytest >= 8 behavior), with options only when a
+        // [tool.pytest] / [tool.pytest.ini_options] table is present.
         let text = std::fs::read_to_string(&pyproject).unwrap_or_default();
-        if let Some(options) = pyproject_options(&text) {
-            return Some((pyproject, options));
-        }
+        let options = pyproject_options(&text).unwrap_or_default();
+        return Some((pyproject, options));
     }
     let tox = dir.join("tox.ini");
     if tox.is_file() {

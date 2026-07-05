@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "cito"
+description = "A fast, pytest-compatible test collector and runner, written in Rust."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "Hongquan Zou" }]
+keywords = ["pytest", "testing", "runner", "rust", "cli"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Rust",
+  "Programming Language :: Python",
+  "Topic :: Software Development :: Testing",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/IShinji/cito"
+Changelog = "https://github.com/IShinji/cito/blob/main/CHANGELOG.md"
+
+[tool.maturin]
+bindings = "bin"
+strip = true

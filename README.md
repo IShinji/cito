@@ -1,5 +1,7 @@
 # cito
 
+[![CI](https://github.com/IShinji/cito/actions/workflows/ci.yml/badge.svg)](https://github.com/IShinji/cito/actions/workflows/ci.yml)
+
 **A fast, pytest-compatible test collector and runner, written in Rust.**
 
 *cito* (Latin: "quickly" — the word doctors still write on urgent orders) makes
@@ -43,6 +45,16 @@ And the part that matters more than speed — **the same answers**:
   per task. Suite latency is agent-loop latency.
 - Ruff and uv proved the recipe: reimplement the hot path in Rust, treat the
   existing ecosystem's behavior as a compatibility contract, win by 10–100x.
+
+## Install
+
+Not on PyPI yet. From a checkout (builds with [maturin](https://maturin.rs)
+or plain cargo):
+
+```console
+$ uv tool install .          # or: pip install .
+$ cargo install --path .     # Rust toolchain route
+```
 
 ## What works today
 

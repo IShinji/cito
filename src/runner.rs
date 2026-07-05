@@ -9,6 +9,49 @@ pub struct Outcome {
     pub chunks: usize,
     pub failed: usize,
     pub seconds: f64,
+    pub counts: Counts,
+}
+
+/// Test totals parsed from pytest's summary lines.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Counts {
+    pub passed: u32,
+    pub failed: u32,
+    pub skipped: u32,
+}
+
+impl Counts {
+    pub(crate) fn add(&mut self, other: Counts) {
+        self.passed += other.passed;
+        self.failed += other.failed;
+        self.skipped += other.skipped;
+    }
+}
+
+/// Parse "N passed, M failed, K skipped in X.XXs" from the last nonempty
+/// line of a pytest run.
+pub fn summary_counts(stdout: &str) -> Counts {
+    let Some(line) = stdout.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return Counts::default();
+    };
+    let mut counts = Counts::default();
+    let mut pending: Option<u32> = None;
+    for token in line.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if token.is_empty() {
+            continue;
+        }
+        if let Ok(n) = token.parse::<u32>() {
+            pending = Some(n);
+            continue;
+        }
+        match token {
+            "passed" => counts.passed += pending.take().unwrap_or(0),
+            "failed" | "error" | "errors" => counts.failed += pending.take().unwrap_or(0),
+            "skipped" => counts.skipped += pending.take().unwrap_or(0),
+            _ => pending = None,
+        }
+    }
+    counts
 }
 
 /// Partition node IDs into chunks, keeping whole files together so fixture
@@ -33,21 +76,16 @@ pub fn make_chunks(files: &[FileTests], chunk_size: usize) -> Vec<Vec<String>> {
     chunks
 }
 
-/// Print the pytest summary line for a passing chunk, or the full output for
-/// a failing one. Returns whether the chunk counts as failed.
-pub fn report_chunk(code: Option<i32>, stdout: &str, stderr: &str) -> bool {
+/// Quiet on success, full output on failure. Returns (chunk failed, counts).
+pub fn report_chunk(code: Option<i32>, stdout: &str, stderr: &str) -> (bool, Counts) {
+    let counts = summary_counts(stdout);
     match code {
         // Exit code 5 means "no tests collected"; harmless here.
-        Some(0) | Some(5) => {
-            if let Some(summary) = stdout.lines().rev().find(|l| !l.trim().is_empty()) {
-                println!("{}", summary.trim());
-            }
-            false
-        }
+        Some(0) | Some(5) => (false, counts),
         _ => {
             print!("{stdout}");
             eprint!("{stderr}");
-            true
+            (true, counts)
         }
     }
 }
@@ -58,6 +96,7 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
     let total = chunks.len();
     let queue = Mutex::new(VecDeque::from(chunks));
     let failed = Mutex::new(0usize);
+    let totals = Mutex::new(Counts::default());
     let start = Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..workers.max(1) {
@@ -69,7 +108,7 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
                     .args(["-m", "pytest", "-q", "--no-header"])
                     .args(&ids)
                     .output();
-                let chunk_failed = match output {
+                let (chunk_failed, counts) = match output {
                     Ok(out) => report_chunk(
                         out.status.code(),
                         &String::from_utf8_lossy(&out.stdout),
@@ -77,9 +116,10 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
                     ),
                     Err(err) => {
                         eprintln!("cito: failed to spawn {python}: {err}");
-                        true
+                        (true, Counts::default())
                     }
                 };
+                totals.lock().expect("totals lock").add(counts);
                 if chunk_failed {
                     *failed.lock().expect("failed lock") += 1;
                 }
@@ -88,9 +128,27 @@ pub fn run(files: Vec<FileTests>, workers: usize, chunk_size: usize, python: &st
     });
 
     let failed = *failed.lock().expect("failed lock");
+    let counts = *totals.lock().expect("totals lock");
     Outcome {
         chunks: total,
         failed,
         seconds: start.elapsed().as_secs_f64(),
+        counts,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pytest_summary_lines() {
+        let pass = summary_counts("....\n11000 passed in 1.79s\n");
+        assert_eq!((pass.passed, pass.failed, pass.skipped), (11000, 0, 0));
+        let mixed = summary_counts("1 failed, 10 passed, 2 skipped in 0.21s\n");
+        assert_eq!((mixed.passed, mixed.failed, mixed.skipped), (10, 1, 2));
+        let errors = summary_counts("3 errors in 0.10s");
+        assert_eq!(errors.failed, 3);
+        assert_eq!(summary_counts(""), Counts::default());
     }
 }

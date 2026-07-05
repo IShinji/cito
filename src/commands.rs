@@ -108,8 +108,13 @@ pub fn run(
         runner::run(files, workers, chunk, &python)
     };
     eprintln!(
-        "cito: {} chunk(s), {} failed, {:.2}s wall",
-        outcome.chunks, outcome.failed, outcome.seconds
+        "cito: {} passed, {} failed, {} skipped across {} chunk(s) ({} failed) in {:.2}s",
+        outcome.counts.passed,
+        outcome.counts.failed,
+        outcome.counts.skipped,
+        outcome.chunks,
+        outcome.failed,
+        outcome.seconds
     );
     if outcome.failed == 0 {
         ExitCode::SUCCESS

@@ -77,6 +77,26 @@ fn basic_tree_matches_pytest() {
     assert_eq!(ids, expected);
 }
 
+/// Plugin-heavy decorators must not disturb collection: hypothesis @given
+/// and mock.patch are ID-neutral; parametrize still expands next to them.
+#[test]
+fn plugins_tree_matches_pytest() {
+    let root = fixture("plugins");
+    let ids = collect_ids(&root, &root);
+    let mut expected: Vec<String> = [
+        "test_plugins.py::test_asyncio_auto",
+        "test_plugins.py::test_hypothesis_given",
+        "test_plugins.py::test_mock_patch",
+        "test_plugins.py::test_mock_plus_params[1]",
+        "test_plugins.py::test_mock_plus_params[2]",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    expected.sort();
+    assert_eq!(ids, expected);
+}
+
 /// The configured tree exercises pytest.ini overrides: python_files,
 /// python_classes, python_functions, norecursedirs. testpaths is exercised
 /// by walking `suite` the way `commands::resolve_roots` would.

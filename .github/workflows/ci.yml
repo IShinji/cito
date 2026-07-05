@@ -29,12 +29,16 @@ jobs:
       - run: cargo build --release
       - name: Differential check on fixtures
         run: |
-          uv run --with pytest scripts/diff_collect.py tests/fixtures/basic
-          uv run --with pytest scripts/diff_collect.py tests/fixtures/configured
+          uv run --no-project --with pytest scripts/diff_collect.py tests/fixtures/basic
+          uv run --no-project --with pytest scripts/diff_collect.py tests/fixtures/configured
+      - name: Differential check with plugins (asyncio, hypothesis)
+        run: |
+          uv run --no-project --with pytest --with pytest-asyncio --with hypothesis \
+            scripts/diff_collect.py tests/fixtures/plugins
       - name: Differential check on a generated corpus
         run: |
           python3 bench/gen_corpus.py --files 60 --tests 10 --out /tmp/corpus
-          uv run --with pytest scripts/diff_collect.py /tmp/corpus
+          uv run --no-project --with pytest scripts/diff_collect.py /tmp/corpus
       - name: Differential check against pytest's own test suite
         run: |
           git clone --depth 1 --branch 9.1.1 https://github.com/pytest-dev/pytest /tmp/pytest-repo
