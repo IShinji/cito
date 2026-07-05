@@ -19,6 +19,10 @@ Initial release.
 - `--python` probe for module-level `pytest.importorskip` requirements.
 - `cito run`: parallel execution across pytest subprocesses; `--warm` keeps
   workers alive across chunks (`pytest.main()` in-process).
+- `cito run --json` (machine-readable summary), pytest-compatible exit
+  code 5 when nothing is collected, `-k` on collect, conftest
+  `collect_ignore`/`collect_ignore_glob` (literal lists), `.cito/` cache
+  self-gitignores, CI matrix adds macOS + experimental Windows.
 - `-k` keyword expressions (and/or/not), `-x`/`--maxfail` fail-fast with
   chunk skipping, `pytest.param(...)` ID rendering (including `id=`),
   re-export chasing for base classes (`base/__init__.py` patterns), warm

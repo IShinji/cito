@@ -247,6 +247,11 @@ fn write_lastfailed(
     let path = lastfailed_path(config);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
+        // Cache directories ignore themselves, like .pytest_cache.
+        let marker = dir.join(".gitignore");
+        if !marker.exists() {
+            let _ = std::fs::write(&marker, "*\n");
+        }
     }
     let mut body = merged.join("\n");
     if !body.is_empty() {
@@ -259,8 +264,24 @@ fn write_lastfailed(
 // Commands
 // ---------------------------------------------------------------------------
 
-pub fn collect(paths: Vec<PathBuf>, json: bool, count: bool, python: Option<String>) -> ExitCode {
-    let Collected { files, .. } = collect_files(paths, python.as_deref());
+pub fn collect(
+    paths: Vec<PathBuf>,
+    json: bool,
+    count: bool,
+    python: Option<String>,
+    kexpr: Option<String>,
+) -> ExitCode {
+    let kexpr = match kexpr.as_deref().map(keyword::parse).transpose() {
+        Ok(expr) => expr,
+        Err(err) => {
+            eprintln!("cito: invalid -k expression: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Collected { mut files, .. } = collect_files(paths, python.as_deref());
+    if let Some(expr) = &kexpr {
+        apply_keyword(&mut files, expr);
+    }
     let total: usize = files.iter().map(|f| f.tests.len()).sum();
     if json {
         println!(
@@ -352,6 +373,7 @@ pub fn run(
     watch: bool,
     maxfail: usize,
     kexpr: Option<String>,
+    json: bool,
 ) -> ExitCode {
     let kexpr = match kexpr.as_deref().map(keyword::parse).transpose() {
         Ok(expr) => expr,
@@ -383,11 +405,31 @@ pub fn run(
         maxfail,
     };
     let pool = warm_workers.then(|| WarmPool::new(&options.python, options.workers));
+    let collected: usize = files.iter().map(|f| f.tests.len()).sum();
     let outcome = run_once(files, &config, &options, pool.as_ref(), &[]);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "collected": collected,
+                "passed": outcome.counts.passed,
+                "failed": outcome.counts.failed,
+                "skipped": outcome.counts.skipped,
+                "chunks": outcome.chunks,
+                "failed_chunks": outcome.failed,
+                "skipped_chunks": outcome.skipped_chunks,
+                "seconds": outcome.seconds,
+                "failed_ids": outcome.failed_ids,
+            })
+        );
+    }
     if watch {
         return watch_loop(&config, &roots, &options, pool.as_ref(), kexpr.as_ref());
     }
-    if outcome.failed == 0 {
+    if collected == 0 {
+        // pytest exit code 5: no tests were collected/ran.
+        ExitCode::from(5)
+    } else if outcome.failed == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

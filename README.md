@@ -74,6 +74,7 @@ $ cito run --lf                   # only the tests that failed last time
 $ cito run --watch --warm         # live loop: warm workers survive across saves
 $ cito run -k "http and not slow" # keyword expressions
 $ cito run -x                     # stop at first failure (--maxfail N)
+$ cito run --json                 # machine-readable summary for agents/CI
 ```
 
 - **Configuration discovery**: `pytest.ini`, `pyproject.toml` (`[tool.pytest]`
@@ -132,8 +133,9 @@ Known gaps, tracked honestly:
   including pytest's duplicate-ID suffixes (True0/True1), which always
   fall back
 - `pytest_generate_tests`-generated *extra* tests that add new names
-- plugin-driven collection hooks (`conftest.py` `collect_ignore`, custom
-  collectors)
+- plugin-driven collection hooks and custom collectors (literal
+  `collect_ignore` / `collect_ignore_glob` lists in conftest.py ARE
+  supported; computed appends are not)
 
 ## Architecture (where this is going)
 

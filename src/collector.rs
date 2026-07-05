@@ -95,6 +95,9 @@ struct Module {
     order: Vec<TopItem>,
     /// Module names demanded via module-level `pytest.importorskip(...)`.
     skip_requires: Vec<String>,
+    /// conftest.py `collect_ignore` / `collect_ignore_glob` (literal lists).
+    collect_ignore: Vec<String>,
+    collect_ignore_glob: Vec<String>,
     /// A `pytest_generate_tests` hook here parametrizes tests in ways static
     /// analysis cannot see; all expansions in scope must fall back.
     has_generate_tests: bool,
@@ -251,6 +254,8 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
         fixtures: HashMap::new(),
         order: Vec::new(),
         skip_requires: Vec::new(),
+        collect_ignore: Vec::new(),
+        collect_ignore_glob: Vec::new(),
         has_generate_tests: false,
     };
     let mut aliases = params::ParamAliases::new();
@@ -295,6 +300,15 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                 if let [Expr::Name(target)] = assign.targets.as_slice() {
                     if let Some(alias) = params::parametrize_alias(&assign.value) {
                         aliases.insert(target.id.to_string(), alias);
+                    }
+                    // conftest collect_ignore lists (literal entries only).
+                    if matches!(target.id.as_str(), "collect_ignore" | "collect_ignore_glob") {
+                        let entries = string_list(&assign.value);
+                        if target.id.as_str() == "collect_ignore" {
+                            module.collect_ignore.extend(entries);
+                        } else {
+                            module.collect_ignore_glob.extend(entries);
+                        }
                     }
                 }
                 // `mpl = pytest.importorskip("matplotlib")`.
@@ -435,6 +449,22 @@ fn build_class(class: &ast::StmtClassDef, aliases: &params::ParamAliases) -> Cla
         expansion: class_info.expansion,
         has_ctor,
     }
+}
+
+/// Literal strings from a list/tuple expression.
+fn string_list(expr: &Expr) -> Vec<String> {
+    let elements = match expr {
+        Expr::List(l) => &l.elts,
+        Expr::Tuple(t) => &t.elts,
+        _ => return Vec::new(),
+    };
+    elements
+        .iter()
+        .filter_map(|e| match e {
+            Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `pytest.importorskip("name")` (or bare `importorskip("name")`).
@@ -878,6 +908,26 @@ fn emit_module(resolver: &mut Resolver, module: &Rc<Module>) -> Vec<String> {
     // its conftest chain.
     let mut contexts = vec![module.clone()];
     contexts.extend(resolver.conftest_chain(&module.dir));
+
+    // conftest `collect_ignore` / `collect_ignore_glob` drop matching files
+    // (literal entries only; computed appends are invisible to us).
+    for conftest in contexts.iter().skip(1) {
+        for entry in &conftest.collect_ignore {
+            if conftest.dir.join(entry) == module.path {
+                return Vec::new();
+            }
+        }
+        if let Ok(rel) = module.path.strip_prefix(&conftest.dir) {
+            for pattern in &conftest.collect_ignore_glob {
+                if globset::Glob::new(pattern)
+                    .map(|g| g.compile_matcher().is_match(rel))
+                    .unwrap_or(false)
+                {
+                    return Vec::new();
+                }
+            }
+        }
+    }
 
     // With a probe python, module-level `importorskip` in the file or its
     // conftest chain drops the whole module when the dependency is absent,

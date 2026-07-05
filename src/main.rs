@@ -31,6 +31,9 @@ enum Command {
         /// environment. Without it, collection is fully static.
         #[arg(long)]
         python: Option<String>,
+        /// Only list tests matching this keyword expression.
+        #[arg(short = 'k')]
+        keyword: Option<String>,
     },
     /// Run tests by fanning collected node IDs out across pytest processes (experimental).
     Run {
@@ -66,6 +69,9 @@ enum Command {
         /// combined with and/or/not, pytest-style).
         #[arg(short = 'k')]
         keyword: Option<String>,
+        /// Print a machine-readable JSON summary to stdout after the run.
+        #[arg(long, conflicts_with = "watch")]
+        json: bool,
     },
 }
 
@@ -77,7 +83,8 @@ fn main() -> ExitCode {
             json,
             count,
             python,
-        } => cito::commands::collect(paths, json, count, python),
+            keyword,
+        } => cito::commands::collect(paths, json, count, python, keyword),
         Command::Run {
             paths,
             workers,
@@ -89,10 +96,11 @@ fn main() -> ExitCode {
             maxfail,
             fail_fast,
             keyword,
+            json,
         } => {
             let maxfail = if fail_fast { 1 } else { maxfail };
             cito::commands::run(
-                paths, workers, chunk, python, warm, lf, watch, maxfail, keyword,
+                paths, workers, chunk, python, warm, lf, watch, maxfail, keyword, json,
             )
         }
     }
