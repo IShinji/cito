@@ -38,6 +38,24 @@ MATRIX = [
     ("pydantic", "https://github.com/pydantic/pydantic", ["v{v}", "{v}"], [], [], 0),
     ("fastapi", "https://github.com/fastapi/fastapi", ["{v}", "v{v}"], [], [], 0),
     ("sympy", "https://github.com/sympy/sympy", ["sympy-{v}", "{v}"], [], [], 45),
+    # pillow: 1 extra = tests guarded by an imported platform predicate
+    # (`if is_win32():`), beyond static reach.
+    ("pillow", "https://github.com/python-pillow/Pillow", ["{v}", "v{v}"], [], [], 1),
+
+    ("typer", "https://github.com/fastapi/typer", ["{v}", "v{v}"], [], [], 0),
+    ("trio", "https://github.com/python-trio/trio", ["v{v}", "{v}"], [], [], 0),
+    # aiohttp: ~19 extras = marks applied dynamically by conftest hooks
+    # (pytest_collection_modifyitems tagging whole directories) interacting
+    # with addopts -m deselection.
+    ("aiohttp", "https://github.com/aio-libs/aiohttp", ["v{v}", "{v}"], [], [], 20),
+    # Documented out of the matrix (not collection-semantics issues):
+    # - pygments: custom pytest_collect_file collectors turn example files
+    #   (.pmod, ...) into test items
+    # - polars: suite imports ~40 optional integrations (deltalake,
+    #   pyiceberg, moto[server], ...) — needs the full dev environment
+    # - psutil: repo source tree shadows the compiled wheel; suite must run
+    #   against an installed build
+    # - hypothesis: monorepo-subproject rootdir nuance under investigation
     # Skipped by design (documented): sqlalchemy and django test suites
     # require their own collection-bootstrap plugins; pytest itself collects
     # nothing without them.

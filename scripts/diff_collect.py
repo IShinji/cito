@@ -22,7 +22,8 @@ import sys
 
 def pytest_ids(target: pathlib.Path, python: str, args: list[str]) -> set[str]:
     proc = subprocess.run(
-        [python, "-m", "pytest", "--collect-only", "-q", *args],
+        # --verbosity=-1 re-flattens the listing when repo addopts add -v.
+        [python, "-m", "pytest", "--collect-only", "-q", "--verbosity=-1", *args],
         capture_output=True,
         text=True,
         cwd=target,

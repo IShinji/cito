@@ -110,6 +110,8 @@ struct Module {
     pytestmark: Vec<String>,
     /// `slow = pytest.mark.slow` style aliases defined in this module.
     mark_aliases: HashMap<String, String>,
+    /// `pytest_plugins = [...]` declarations (conftest only, per pytest).
+    plugin_modules: Vec<String>,
     /// conftest.py `collect_ignore` / `collect_ignore_glob` (literal lists).
     collect_ignore: Vec<String>,
     collect_ignore_glob: Vec<String>,
@@ -329,6 +331,7 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
         helper_calls: Vec::new(),
         pytestmark: Vec::new(),
         mark_aliases: HashMap::new(),
+        plugin_modules: Vec::new(),
         collect_ignore: Vec::new(),
         collect_ignore_glob: Vec::new(),
         has_generate_tests: false,
@@ -383,6 +386,20 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                     if let Some(alias) = params::parametrize_alias(&assign.value) {
                         aliases.insert(target.id.to_string(), alias);
                     }
+                    if target.id.as_str() == "pytest_plugins" {
+                        match &*assign.value {
+                            Expr::List(l) => module
+                                .plugin_modules
+                                .extend(l.elts.iter().filter_map(string_value_of)),
+                            Expr::Tuple(t) => module
+                                .plugin_modules
+                                .extend(t.elts.iter().filter_map(string_value_of)),
+                            Expr::StringLiteral(v) => {
+                                module.plugin_modules.push(v.value.to_str().to_string())
+                            }
+                            _ => {}
+                        }
+                    }
                     if target.id.as_str() == "pytestmark" {
                         match &*assign.value {
                             Expr::List(l) => module
@@ -410,7 +427,9 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                     module.skip_requires.push(name);
                 }
             }
-            Stmt::Expr(expr_stmt) => {
+            // Only live (non-dead-branch) statements can skip the module
+            // or demand dependencies.
+            Stmt::Expr(expr_stmt) if top => {
                 // Bare `pytest.importorskip("numba")` at module level.
                 if let Some(name) = importorskip_name(&expr_stmt.value) {
                     module.skip_requires.push(name);
@@ -482,20 +501,56 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                 }
             }
             // Definitions inside top-level if/else and try/except are real
-            // module members for whichever branch runs; collecting from all
-            // branches over-approximates, and the keep-last name dedupe
+            // module members for whichever branch runs. Guards over
+            // sys.platform / os.name / sys.argv are evaluated; branches that
+            // are decidably dead contribute imports only. Undecidable
+            // branches are all collected, and the keep-last name dedupe
             // resolves the common "same name in both branches" pattern.
             Stmt::If(if_stmt) if top => {
-                scan(&if_stmt.body, module, aliases, true);
+                let cond = eval_condition(&if_stmt.test);
+                scan(&if_stmt.body, module, aliases, cond != Some(false));
+                // else/elif run when the if-condition is false or unknown;
+                // elif conditions are rarely used in these guards, so treat
+                // them like the else arm.
+                let else_live = cond != Some(true);
                 for clause in &if_stmt.elif_else_clauses {
-                    scan(&clause.body, module, aliases, true);
+                    let live = else_live
+                        && clause
+                            .test
+                            .as_ref()
+                            .map(|t| eval_condition(t) != Some(false))
+                            .unwrap_or(true);
+                    scan(&clause.body, module, aliases, live);
                 }
             }
             Stmt::Try(try_stmt) if top => {
+                // `try: import x / except ImportError: pytest.skip(...)` is
+                // importorskip in disguise: map it onto the probe.
+                let handler_skips = try_stmt.handlers.iter().any(|h| {
+                    let ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_calls_skip(&h.body)
+                });
+                if handler_skips {
+                    for stmt in &try_stmt.body {
+                        match stmt {
+                            Stmt::Import(import) => {
+                                for alias in &import.names {
+                                    module.skip_requires.push(alias.name.to_string());
+                                }
+                            }
+                            Stmt::ImportFrom(import) if import.level == 0 => {
+                                if let Some(m) = &import.module {
+                                    module.skip_requires.push(m.to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 scan(&try_stmt.body, module, aliases, true);
                 for handler in &try_stmt.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
-                    scan(&h.body, module, aliases, true);
+                    scan(&h.body, module, aliases, false);
                 }
                 scan(&try_stmt.orelse, module, aliases, true);
                 scan(&try_stmt.finalbody, module, aliases, true);
@@ -580,6 +635,13 @@ fn build_class(class: &ast::StmtClassDef, aliases: &params::ParamAliases) -> Cla
     }
 }
 
+fn string_value_of(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
+        _ => None,
+    }
+}
+
 /// Literal strings from a list/tuple expression.
 fn string_list(expr: &Expr) -> Vec<String> {
     let elements = match expr {
@@ -594,6 +656,95 @@ fn string_list(expr: &Expr) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Best-effort constant evaluation of module-level guard conditions over
+/// `sys.platform`, `os.name`, and `sys.argv` (cito never passes plugin
+/// flags, and neither does a default pytest invocation).
+fn eval_condition(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::BoolOp(op) => {
+            let values: Option<Vec<bool>> = op.values.iter().map(eval_condition).collect();
+            let values = values?;
+            Some(match op.op {
+                ast::BoolOp::And => values.iter().all(|v| *v),
+                ast::BoolOp::Or => values.iter().any(|v| *v),
+            })
+        }
+        Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOp::Not) => {
+            eval_condition(&u.operand).map(|v| !v)
+        }
+        Expr::Compare(cmp) if cmp.ops.len() == 1 && cmp.comparators.len() == 1 => {
+            let left = &cmp.left;
+            let right = &cmp.comparators[0];
+            match cmp.ops[0] {
+                ast::CmpOp::Eq => Some(const_str(left)? == const_str(right)?),
+                ast::CmpOp::NotEq => Some(const_str(left)? != const_str(right)?),
+                ast::CmpOp::In | ast::CmpOp::NotIn => {
+                    // `"--flag" in sys.argv`: never true for default runs.
+                    if dotted(right).as_deref() == Some("sys.argv") {
+                        let contains = false;
+                        Some(match cmp.ops[0] {
+                            ast::CmpOp::In => contains,
+                            _ => !contains,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        // sys.platform.startswith("...")
+        Expr::Call(call) => {
+            let Expr::Attribute(attr) = &*call.func else {
+                return None;
+            };
+            if attr.attr.as_str() != "startswith" {
+                return None;
+            }
+            let base = const_str(&attr.value)?;
+            match call.arguments.args.first() {
+                Some(Expr::StringLiteral(s)) => Some(base.starts_with(s.value.to_str())),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// String value of an expression when it is a literal or a known runtime
+/// constant (`sys.platform`, `os.name`) for the machine cito runs on.
+fn const_str(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
+        _ => match dotted(expr)?.as_str() {
+            "sys.platform" => Some(
+                match std::env::consts::OS {
+                    "macos" => "darwin",
+                    "windows" => "win32",
+                    other => other,
+                }
+                .to_string(),
+            ),
+            "os.name" => Some(
+                match std::env::consts::OS {
+                    "windows" => "nt",
+                    _ => "posix",
+                }
+                .to_string(),
+            ),
+            _ => None,
+        },
+    }
+}
+
+fn dotted(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(name) => Some(name.id.to_string()),
+        Expr::Attribute(attr) => Some(format!("{}.{}", dotted(&attr.value)?, attr.attr)),
+        _ => None,
+    }
 }
 
 /// `pytest.skip(...)` at module level (any arguments).
@@ -703,7 +854,7 @@ impl<'a> Resolver<'a> {
         let ok = std::process::Command::new(&python)
             .arg("-c")
             .arg(format!(
-                "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec({name:?}) else 1)"
+                "import importlib, sys\ntry:\n    importlib.import_module({name:?})\nexcept BaseException:\n    sys.exit(1)"
             ))
             .output()
             .map(|out| out.status.success())
@@ -724,13 +875,17 @@ impl<'a> Resolver<'a> {
         if pending.is_empty() {
             return;
         }
+        // Real imports, not find_spec: pytest.importorskip imports, and a
+        // module can exist yet fail to import (PIL.FpxImagePlugin without
+        // olefile installed).
         const PROBE: &str = r#"
-import importlib.util, json, sys
+import importlib, json, sys
 result = {}
 for name in json.loads(sys.argv[1]):
     try:
-        result[name] = importlib.util.find_spec(name) is not None
-    except Exception:
+        importlib.import_module(name)
+        result[name] = True
+    except BaseException:
         result[name] = False
 print(json.dumps(result))
 "#;
@@ -1154,9 +1309,22 @@ fn emit_module(
     marker: Option<&crate::keyword::KExpr>,
 ) -> Vec<String> {
     // Fixture visibility for tests in this module: the module itself plus
-    // its conftest chain.
+    // its conftest chain, plus any pytest_plugins modules those conftests
+    // declare (their fixtures and pytest_generate_tests hooks apply too —
+    // e.g. aiohttp.pytest_plugin parametrizes the loop fixture).
     let mut contexts = vec![module.clone()];
     contexts.extend(resolver.conftest_chain(&module.dir));
+    let declared: Vec<String> = contexts
+        .iter()
+        .flat_map(|m| m.plugin_modules.iter().cloned())
+        .collect();
+    for plugin in declared {
+        if let Some(target) =
+            resolver.resolve_ref(&ModuleRef::Absolute(plugin), &module.dir.clone())
+        {
+            contexts.push(target);
+        }
+    }
 
     // conftest `collect_ignore` / `collect_ignore_glob` drop matching files
     // (literal entries only; computed appends are invisible to us).

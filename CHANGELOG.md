@@ -4,6 +4,18 @@
 
 Initial release.
 
+- Third validation wave (typer, trio exact; pillow 1 extra; aiohttp 19):
+  platform/argv guard conditions (`sys.platform == ...`,
+  `"--flag" in sys.argv`) are constant-evaluated, so platform-gated
+  module skips and branch definitions resolve like pytest on this machine;
+  `try: import x / except: pytest.skip()` maps onto the importorskip probe;
+  the probe now really imports (a module can exist yet fail to import);
+  conftest `pytest_plugins` declarations are resolved and their modules
+  join fixture visibility (aiohttp.pytest_plugin's loop parametrization);
+  diff oracle hardened against repos whose addopts add `-v`.
+  Documented out: pygments (custom file collectors), polars (needs full
+  dev env), psutil (source shadows wheel), hypothesis (monorepo rootdir
+  nuance under investigation).
 - Second validation wave (werkzeug, requests, more-itertools, packaging,
   pluggy, tornado, black, pydantic, fastapi, sympy — 15/16 exact): symlinked
   test directories are followed like pytest does (pydantic vendors

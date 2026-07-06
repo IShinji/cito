@@ -51,6 +51,10 @@ And the part that matters more than speed — **the same answers**:
 | pydantic 2.13.4 | 12,775 | 0 | 0 |
 | fastapi 0.139.0 | 3,317 | 0 | 0 |
 | sympy 1.14.0 | 13,657 | 0 | 39 (0.3%: custom @SKIP machinery + env-conditional defs) |
+| typer 0.26.8 | 1,379 | 0 | 0 |
+| trio 0.33.0 | 895 | 0 | 0 |
+| pillow 12.3.0 | 5,218 | 0 | 1 |
+| aiohttp 3.14.1 | 4,364 | 0 | 19 (hook-applied directory marks) |
 
 (`scripts/validate_repos.py` reruns the whole matrix against fresh clones —
 the release gate. sqlalchemy and django are documented out: their suites
