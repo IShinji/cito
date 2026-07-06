@@ -53,6 +53,13 @@ MATRIX = [
     # litestar: needs a pinned full dev environment (time_machine API drift
     # etc.) — polars family.
     ("pytest_asyncio", "https://github.com/pytest-dev/pytest-asyncio", ["v{v}", "{v}"], [], [], 0),
+    ("pytest_xdist", "https://github.com/pytest-dev/pytest-xdist", ["v{v}", "{v}"], [], [], 0),
+    ("httpcore", "https://github.com/encode/httpcore", ["{v}", "v{v}"], [], [], 0),
+    # Documented out this wave: anyio (plugin self-test needs an isolated
+    # env), ipython (ipdoctest plugin collects doctests from all sources),
+    # mkdocs (unittest-style *_tests.py suite, not pytest), yt-dlp
+    # (setattr-loop generates ~5.8k extractor tests at import time).
+    ("textual", "https://github.com/Textualize/textual", ["v{v}", "{v}"], [], [], 0),
     # aiohttp: ~19 extras = marks applied dynamically by conftest hooks
     # (pytest_collection_modifyitems tagging whole directories) interacting
     # with addopts -m deselection.
@@ -79,7 +86,9 @@ def clone_at(url: str, templates: list, version: str, dest: pathlib.Path) -> boo
     if dest.exists():
         return True
     for template in templates:
-        tag = template.format(v=version, v_und=version.replace(".", "_"))
+        parts = version.split(".")
+        v_date = ".".join([parts[0], *[p.zfill(2) for p in parts[1:]]])
+        tag = template.format(v=version, v_und=version.replace(".", "_"), v_date=v_date)
         # Neutralize git-lfs (may be configured globally but not installed);
         # LFS payloads are never needed for collection.
         env = dict(os.environ, GIT_LFS_SKIP_SMUDGE="1")

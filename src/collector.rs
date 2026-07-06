@@ -127,6 +127,8 @@ struct Module {
     cond_blocks: Vec<(DeferredGuard, Vec<String>)>,
     /// Names defined on unconditional top-level paths (never deadened).
     certain_names: HashSet<String>,
+    /// Names removed via module-level `del NAME` — pytest never sees them.
+    deleted_names: HashSet<String>,
     /// Module-level `pytestmark = ...` mark names.
     pytestmark: Vec<String>,
     /// `slow = pytest.mark.slow` style aliases defined in this module.
@@ -363,6 +365,7 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
         synthetic_testcases: Vec::new(),
         cond_blocks: Vec::new(),
         certain_names: HashSet::new(),
+        deleted_names: HashSet::new(),
         pytestmark: Vec::new(),
         mark_aliases: HashMap::new(),
         plugin_modules: Vec::new(),
@@ -483,6 +486,16 @@ fn scan(
                 // `mpl = pytest.importorskip("matplotlib")`.
                 if let Some(name) = importorskip_name(&assign.value) {
                     module.skip_requires.push(name);
+                }
+            }
+            // `del TestFoo` at module level removes the binding before
+            // pytest ever collects it (scipy's linprog class-factory idiom).
+            Stmt::Delete(delete) if top => {
+                for target in &delete.targets {
+                    if let Expr::Name(name) = target {
+                        module.deleted_names.insert(name.id.to_string());
+                        module.certain_names.remove(name.id.as_str());
+                    }
                 }
             }
             // Only live (non-dead-branch) statements can skip the module
@@ -628,21 +641,38 @@ fn scan(
                     let ast::ExceptHandler::ExceptHandler(h) = h;
                     body_calls_skip(&h.body)
                 });
-                if handler_skips {
-                    for stmt in &try_stmt.body {
-                        match stmt {
-                            Stmt::Import(import) => {
-                                for alias in &import.names {
-                                    module.skip_requires.push(alias.name.to_string());
-                                }
+                let mut try_imports: Vec<String> = Vec::new();
+                for stmt in &try_stmt.body {
+                    match stmt {
+                        Stmt::Import(import) => {
+                            for alias in &import.names {
+                                try_imports.push(alias.name.to_string());
                             }
-                            Stmt::ImportFrom(import) if import.level == 0 => {
-                                if let Some(m) = &import.module {
-                                    module.skip_requires.push(m.to_string());
-                                }
-                            }
-                            _ => {}
                         }
+                        Stmt::ImportFrom(import) if import.level == 0 => {
+                            if let Some(m) = &import.module {
+                                try_imports.push(m.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if handler_skips {
+                    module.skip_requires.extend(try_imports.iter().cloned());
+                }
+                // `try: import x; has_x = True / except: has_x = False`
+                // availability flags — same probe machinery as bindings.
+                if let Some(first_import) = try_imports.first() {
+                    // Either polarity: `has_x = True` inside the try body,
+                    // or `has_x = False` inside an except handler (with the
+                    // True assignment anywhere earlier).
+                    let mut flags = bool_assignments(&try_stmt.body, true);
+                    for handler in &try_stmt.handlers {
+                        let ast::ExceptHandler::ExceptHandler(h) = handler;
+                        flags.extend(bool_assignments(&h.body, false));
+                    }
+                    for flag in flags {
+                        module.import_bindings.insert(flag, first_import.clone());
                     }
                 }
                 scan(&try_stmt.body, module, aliases, true, certain);
@@ -862,6 +892,22 @@ fn dotted(expr: &Expr) -> Option<String> {
         Expr::Attribute(attr) => Some(format!("{}.{}", dotted(&attr.value)?, attr.attr)),
         _ => None,
     }
+}
+
+/// Names assigned the boolean literal `value` in a statement list.
+fn bool_assignments(stmts: &[Stmt], value: bool) -> Vec<String> {
+    stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Assign(assign) => match (assign.targets.as_slice(), &*assign.value) {
+                ([Expr::Name(target)], Expr::BooleanLiteral(b)) if b.value == value => {
+                    Some(target.id.to_string())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 /// `import_module('name')` / `importorskip('name')` call → the name.
@@ -1621,6 +1667,7 @@ fn emit_module(
     for name in alive.iter().chain(module.certain_names.iter()) {
         dead.remove(name);
     }
+    dead.extend(module.deleted_names.iter().cloned());
 
     // A pytest_generate_tests hook or a parametrized autouse fixture
     // anywhere in scope can add parameters we cannot see; exact expansions

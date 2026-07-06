@@ -57,6 +57,11 @@ And the part that matters more than speed — **the same answers**:
 | django-rest-framework 3.17.1 | 1,552 | 0 | 0 |
 | sqlglot 30.12.0 | 1,127 | 0 | 0 |
 | pytest-asyncio 1.4.0 | 299 | 0 | 0 |
+| textual 8.2.8 | 3,467 | 0 | 0 |
+| pytest-xdist 3.8.0 | 212 | 0 | 0 |
+| httpcore 1.0.9 | 220 | 0 | 0 |
+| scikit-learn wheel (site-packages) | 47,349 | 0 | 2 |
+| scipy wheel (site-packages) | 96,387 | 3,467 (3.6%: `type()` class factories) | 5 |
 | numpy 3.x wheel (site-packages) | 49,443 | 760 (1.5%: `type()` loop-generated SIMD classes) | 0 |
 | trio 0.33.0 | 895 | 0 | 0 |
 | pillow 12.3.0 | 5,218 | 0 | 0 |

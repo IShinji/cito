@@ -4,6 +4,16 @@
 
 Initial release.
 
+- Fifth validation wave: textual 3,467 / pytest-xdist 212 / httpcore 220
+  zero-diff; scikit-learn wheel 47,349 IDs with ZERO missing (2 extras);
+  scipy wheel 96,387 IDs with 5 extras (missing 3.6% = type() class
+  factories, the genuinely-dynamic family). New systematic rule:
+  try-import boolean availability flags (`has_x = True/False` around an
+  import) bind to the probe, so `if has_umfpack:` test classes resolve like
+  pytest (cleared 154 scipy extras); module-level `del NAME` removes
+  bindings. Documented out: anyio (plugin self-test isolation), ipython
+  (ipdoctest), mkdocs (unittest-style suite), yt-dlp (setattr-loop
+  extractor tests), matplotlib wheel (no baseline images).
 - Fourth validation wave: networkx 7,100, cryptography 4,472 (class-body
   `test_x = factory(...)` assignments now emit as fallback methods),
   django-rest-framework 1,552 (pytest-django), sqlglot 1,127 (exact-exact),
