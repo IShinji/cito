@@ -132,8 +132,11 @@ pytest's node IDs are the interface:
    cito's declared fallback wherever static analysis cannot be sure.
 
 `scripts/diff_collect.py` enforces both directions on every commit against
-the fixture trees and a generated corpus, and is run manually against real
-repositories (pytest, pandas) before releases.
+the fixture trees, a generated corpus, and **randomized differential fuzzing**
+(`bench/fuzz_gen.py` builds seeded projects mixing nested classes,
+cross-module inheritance, re-exports, parametrize variants, fixtures, marks,
+and shadowing; 100 seeds pass locally, three run in CI). Real repositories
+(pytest, pandas, flask, rich) are checked before releases.
 
 Known gaps, tracked honestly:
 

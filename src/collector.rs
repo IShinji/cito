@@ -248,6 +248,21 @@ fn parse_file(path: &Path) -> Option<Module> {
     }
 }
 
+/// Python shadowing: a later `def`/`class` with the same name replaces the
+/// earlier one; pytest collects only the surviving object, located at its
+/// last definition site. Keep the LAST occurrence of each name.
+fn dedupe_keep_last<T>(items: Vec<T>, name_of: impl Fn(&T) -> &str) -> Vec<T> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut kept: Vec<T> = Vec::new();
+    for item in items.into_iter().rev() {
+        if seen.insert(name_of(&item).to_string()) {
+            kept.push(item);
+        }
+    }
+    kept.reverse();
+    kept
+}
+
 fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser::ParseError> {
     let syntax = ruff_python_parser::parse_module(source)?.into_syntax();
     let mut module = Module {
@@ -266,6 +281,10 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
     };
     let mut aliases = params::ParamAliases::new();
     scan(&syntax.body, &mut module, &mut aliases, true);
+    module.order = dedupe_keep_last(std::mem::take(&mut module.order), |item| match item {
+        TopItem::Func(def) => def.name.as_str(),
+        TopItem::Class(name) => name.as_str(),
+    });
     Ok(module)
 }
 
@@ -455,6 +474,10 @@ fn build_class(class: &ast::StmtClassDef, aliases: &params::ParamAliases) -> Cla
             _ => {}
         }
     }
+    let items = dedupe_keep_last(items, |item| match item {
+        ClassItem::Method(def) => def.name.as_str(),
+        ClassItem::Nested(name, _) => name.as_str(),
+    });
     Class {
         bases,
         items,

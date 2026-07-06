@@ -19,6 +19,10 @@ Initial release.
 - `--python` probe for module-level `pytest.importorskip` requirements.
 - `cito run`: parallel execution across pytest subprocesses; `--warm` keeps
   workers alive across chunks (`pytest.main()` in-process).
+- Randomized differential fuzzing (bench/fuzz_gen.py): seeded generator
+  covering the hard-corner matrix, verified 100/100 seeds against real
+  pytest; found and fixed a real shadowing bug (duplicate `def` names now
+  keep the last definition, matching Python semantics).
 - `-m` mark expressions evaluated at collection time (marks harvested from
   decorators, class chains, and module pytestmark; CI checks deselection
   parity against pytest); `--changed` runs only content-changed files;

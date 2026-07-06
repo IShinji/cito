@@ -77,6 +77,8 @@ fn basic_tree_matches_pytest() {
         "test_params.py::TestClassLevel::test_combined[2-q]",
         "test_condeps.py::test_needs_missing_dep",
         "test_sample.py::test_addition",
+        "test_shadowing.py::test_shadowed",
+        "test_shadowing.py::TestShadow::test_dup",
         "test_sample.py::test_async_thing",
         "test_sample.py::testnounderscore",
         "test_sample.py::TestWidget::test_render",

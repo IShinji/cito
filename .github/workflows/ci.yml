@@ -48,6 +48,12 @@ jobs:
         run: |
           uv run --no-project --with pytest --with pytest-asyncio --with hypothesis \
             scripts/diff_collect.py tests/fixtures/plugins
+      - name: Differential fuzzing (3 seeds)
+        run: |
+          for seed in 11 42 77; do
+            python3 bench/fuzz_gen.py --seed $seed --out /tmp/fuzz-$seed
+            uv run --no-project --with pytest scripts/diff_collect.py /tmp/fuzz-$seed
+          done
       - name: Differential check on a generated corpus
         run: |
           python3 bench/gen_corpus.py --files 60 --tests 10 --out /tmp/corpus
