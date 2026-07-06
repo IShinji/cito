@@ -7,7 +7,7 @@ use std::time::Instant;
 use serde::Deserialize;
 
 use crate::collector::FileTests;
-use crate::runner::{make_chunks, report_chunk, Counts, Outcome};
+use crate::runner::{make_chunks, report_chunk, ChunkReport, Counts, Outcome};
 
 /// Each worker imports pytest once and then runs `pytest.main()` per chunk
 /// in-process, killing the interpreter+import startup tax that the
@@ -19,20 +19,42 @@ const WORKER_SHIM: &str = r#"
 import contextlib, importlib, io, json, os, sys
 import pytest
 
+_mtimes = {}
+
+def _remember():
+    for mod in list(sys.modules.values()):
+        f = getattr(mod, "__file__", None)
+        if f and f not in _mtimes:
+            try:
+                _mtimes[f] = os.stat(f).st_mtime_ns
+            except OSError:
+                pass
+
+def _purge(targets):
+    stale = set(targets)
+    for f, recorded in list(_mtimes.items()):
+        try:
+            current = os.stat(f).st_mtime_ns
+        except OSError:
+            current = None
+        if current != recorded:
+            stale.add(f)
+            del _mtimes[f]
+    if not stale:
+        return
+    for name, mod in list(sys.modules.items()):
+        try:
+            if getattr(mod, "__file__", None) in stale:
+                del sys.modules[name]
+        except Exception:
+            pass
+    importlib.invalidate_caches()
+
 for line in sys.stdin:
     req = json.loads(line)
     for key, value in (req.get("env") or {}).items():
         os.environ[key] = value
-    purge = req.get("purge") or ()
-    if purge:
-        targets = set(purge)
-        for name, mod in list(sys.modules.items()):
-            try:
-                if getattr(mod, "__file__", None) in targets:
-                    del sys.modules[name]
-            except Exception:
-                pass
-        importlib.invalidate_caches()
+    _purge(req.get("purge") or ())
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         try:
@@ -43,6 +65,7 @@ for line in sys.stdin:
             import traceback
             traceback.print_exc()
             code = 3
+    _remember()
     sys.stdout.write(json.dumps({"code": code, "output": buf.getvalue()}) + "\n")
     sys.stdout.flush()
 "#;
@@ -134,6 +157,7 @@ impl WarmPool {
         let skipped = Mutex::new(0usize);
         let totals = Mutex::new(Counts::default());
         let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let outputs: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let chunk_seq = std::sync::atomic::AtomicUsize::new(0);
         let start = Instant::now();
         std::thread::scope(|scope| {
@@ -166,20 +190,25 @@ impl WarmPool {
                             }
                             None => serde_json::Value::Null,
                         };
-                        let (chunk_failed, counts, ids_failed) = match worker
-                            .run_chunk(&args, purge, &env)
-                        {
+                        let report = match worker.run_chunk(&args, purge, &env) {
                             Some(reply) => report_chunk(Some(reply.code), &reply.output, ""),
                             None => {
-                                eprintln!("cito: pytest worker died; its chunk is marked failed");
                                 *slot = None;
-                                (true, Counts::default(), Vec::new())
+                                ChunkReport {
+                                    failed: true,
+                                    counts: Counts::default(),
+                                    failed_ids: Vec::new(),
+                                    output: Some(
+                                        "cito: pytest worker died; its chunk is marked failed\n"
+                                            .to_string(),
+                                    ),
+                                }
                             }
                         };
                         {
                             let mut totals = totals.lock().expect("totals lock");
-                            totals.add(counts);
-                            if chunk_failed {
+                            totals.add(report.counts);
+                            if report.failed {
                                 *failed.lock().expect("failed lock") += 1;
                             }
                             if maxfail > 0 && totals.failed as usize >= maxfail {
@@ -188,7 +217,13 @@ impl WarmPool {
                                 queue.clear();
                             }
                         }
-                        failures.lock().expect("failures lock").extend(ids_failed);
+                        failures
+                            .lock()
+                            .expect("failures lock")
+                            .extend(report.failed_ids);
+                        if let Some(output) = report.output {
+                            outputs.lock().expect("outputs lock").push(output);
+                        }
                     }
                 });
             }
@@ -200,6 +235,7 @@ impl WarmPool {
         let skipped_chunks = *skipped.lock().expect("skipped lock");
         let counts = *totals.lock().expect("totals lock");
         let failed_ids = failures.into_inner().expect("failures lock");
+        let failure_output = outputs.into_inner().expect("outputs lock");
         Outcome {
             chunks: total,
             failed,
@@ -207,6 +243,7 @@ impl WarmPool {
             seconds: start.elapsed().as_secs_f64(),
             counts,
             failed_ids,
+            failure_output,
         }
     }
 }

@@ -81,10 +81,19 @@ enum Command {
         /// Only run files whose content changed since the last run.
         #[arg(long)]
         changed: bool,
+        /// Execute on the per-project warm daemon (started on demand);
+        /// workers keep pytest and conftest imported across invocations.
+        #[arg(long, conflicts_with = "warm")]
+        daemon: bool,
         /// Extra arguments passed through to every pytest invocation
         /// (e.g. `cito run -- --cov=mypkg --tb=short`).
         #[arg(last = true)]
         pytest_args: Vec<String>,
+    },
+    /// Manage the per-project warm-worker daemon (unix only).
+    Daemon {
+        /// start | stop | status (serve is internal).
+        action: String,
     },
 }
 
@@ -114,6 +123,7 @@ fn main() -> ExitCode {
             pytest_args,
             marker,
             changed,
+            daemon,
         } => {
             let maxfail = if fail_fast { 1 } else { maxfail };
             cito::commands::run(
@@ -130,7 +140,9 @@ fn main() -> ExitCode {
                 pytest_args,
                 marker,
                 changed,
+                daemon,
             )
         }
+        Command::Daemon { action } => cito::commands::daemon_command(&action),
     }
 }

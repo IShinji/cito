@@ -15,6 +15,8 @@ pub struct Outcome {
     pub counts: Counts,
     /// Node IDs pytest reported as FAILED/ERROR (rootdir-relative).
     pub failed_ids: Vec<String>,
+    /// Captured output of failed chunks, printed by the caller.
+    pub failure_output: Vec<String>,
 }
 
 /// Test totals parsed from pytest's summary lines.
@@ -95,18 +97,32 @@ pub fn failed_ids(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-/// Quiet on success, full output on failure.
-pub fn report_chunk(code: Option<i32>, stdout: &str, stderr: &str) -> (bool, Counts, Vec<String>) {
+pub struct ChunkReport {
+    pub failed: bool,
+    pub counts: Counts,
+    pub failed_ids: Vec<String>,
+    /// Full output, present only for failed chunks.
+    pub output: Option<String>,
+}
+
+/// Quiet on success; failed chunks carry their output for the caller.
+pub fn report_chunk(code: Option<i32>, stdout: &str, stderr: &str) -> ChunkReport {
     let counts = summary_counts(stdout);
     let ids = failed_ids(stdout);
     match code {
         // Exit code 5 means "no tests collected"; harmless here.
-        Some(0) | Some(5) => (false, counts, ids),
-        _ => {
-            print!("{stdout}");
-            eprint!("{stderr}");
-            (true, counts, ids)
-        }
+        Some(0) | Some(5) => ChunkReport {
+            failed: false,
+            counts,
+            failed_ids: ids,
+            output: None,
+        },
+        _ => ChunkReport {
+            failed: true,
+            counts,
+            failed_ids: ids,
+            output: Some(format!("{stdout}{stderr}")),
+        },
     }
 }
 
@@ -127,6 +143,7 @@ pub fn run(
     let skipped = Mutex::new(0usize);
     let totals = Mutex::new(Counts::default());
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let outputs: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let chunk_seq = AtomicUsize::new(0);
     let start = Instant::now();
     std::thread::scope(|scope| {
@@ -147,21 +164,23 @@ pub fn run(
                     command.env("COVERAGE_FILE", format!("{base}.{seq}"));
                 }
                 let output = command.output();
-                let (chunk_failed, counts, ids_failed) = match output {
+                let report = match output {
                     Ok(out) => report_chunk(
                         out.status.code(),
                         &String::from_utf8_lossy(&out.stdout),
                         &String::from_utf8_lossy(&out.stderr),
                     ),
-                    Err(err) => {
-                        eprintln!("cito: failed to spawn {python}: {err}");
-                        (true, Counts::default(), Vec::new())
-                    }
+                    Err(err) => ChunkReport {
+                        failed: true,
+                        counts: Counts::default(),
+                        failed_ids: Vec::new(),
+                        output: Some(format!("cito: failed to spawn {python}: {err}\n")),
+                    },
                 };
                 {
                     let mut totals = totals.lock().expect("totals lock");
-                    totals.add(counts);
-                    if chunk_failed {
+                    totals.add(report.counts);
+                    if report.failed {
                         *failed.lock().expect("failed lock") += 1;
                     }
                     if maxfail > 0 && totals.failed as usize >= maxfail {
@@ -170,7 +189,13 @@ pub fn run(
                         queue.clear();
                     }
                 }
-                failures.lock().expect("failures lock").extend(ids_failed);
+                failures
+                    .lock()
+                    .expect("failures lock")
+                    .extend(report.failed_ids);
+                if let Some(output) = report.output {
+                    outputs.lock().expect("outputs lock").push(output);
+                }
             });
         }
     });
@@ -179,6 +204,7 @@ pub fn run(
     let counts = *totals.lock().expect("totals lock");
     let failed_ids = failures.into_inner().expect("failures lock");
     let skipped_chunks = *skipped.lock().expect("skipped lock");
+    let failure_output = outputs.into_inner().expect("outputs lock");
     Outcome {
         chunks: total,
         failed,
@@ -186,6 +212,7 @@ pub fn run(
         seconds: start.elapsed().as_secs_f64(),
         counts,
         failed_ids,
+        failure_output,
     }
 }
 

@@ -10,12 +10,11 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::params::{self, Expansion};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 pub struct FileTests {
     /// rootdir-relative, forward-slash path — the node ID prefix.
     pub path: String,
     /// Absolute path, used to build node IDs that pytest can run from any cwd.
-    #[serde(skip)]
     pub abs_path: PathBuf,
     pub tests: Vec<String>,
 }

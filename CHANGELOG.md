@@ -1,8 +1,16 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.2.0 (unreleased)
 
 Initial release.
+
+- **Per-project warm daemon** (`cito daemon start|stop|status`,
+  `cito run --daemon`, unix): workers keep pytest and conftest imported
+  across CLI invocations — a one-shot `cito run` on a warm daemon completes
+  in ~0.02 s wall. Module freshness is enforced inside the workers (any
+  imported file whose mtime changed is purged before each run), verified by
+  editing a test red/green across daemon runs. Version-skewed daemons are
+  retired automatically; unreachable daemons fall back to local workers.
 
 - `cito collect`: pytest-convention test discovery via ruff's parser,
   parallelized with rayon. pytest config discovery (`pytest.ini`,

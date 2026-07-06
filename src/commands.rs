@@ -361,6 +361,9 @@ pub fn collect(
 }
 
 fn print_summary(outcome: &runner::Outcome) {
+    for output in &outcome.failure_output {
+        print!("{output}");
+    }
     eprintln!(
         "cito: {} passed, {} failed, {} skipped across {} chunk(s) ({} failed) in {:.2}s",
         outcome.counts.passed,
@@ -379,6 +382,7 @@ struct RunOptions {
     maxfail: usize,
     extra_args: Vec<String>,
     coverage_base: String,
+    daemon: bool,
 }
 
 /// If any per-chunk coverage files were produced (the runners point
@@ -446,29 +450,53 @@ fn run_once(
         .map(|f| f.path.clone())
         .collect();
     let total: usize = files.iter().map(|f| f.tests.len()).sum();
-    let mode = if pool.is_some() { "warm" } else { "subprocess" };
+    let mode = if options.daemon {
+        "daemon"
+    } else if pool.is_some() {
+        "warm"
+    } else {
+        "subprocess"
+    };
     eprintln!(
         "cito: running {total} tests across {} {mode} workers",
         options.workers
     );
-    let outcome = match pool {
-        Some(pool) => pool.run(
-            files,
-            options.chunk,
-            options.maxfail,
-            purge,
-            &options.extra_args,
-            Some(&options.coverage_base),
-        ),
-        None => runner::run(
-            files,
-            options.workers,
-            options.chunk,
-            &options.python,
-            options.maxfail,
-            &options.extra_args,
-            Some(&options.coverage_base),
-        ),
+    let outcome = 'exec: {
+        #[cfg(unix)]
+        if options.daemon {
+            if let Some(outcome) = crate::daemon::run(
+                &config.rootdir,
+                &files,
+                &options.python,
+                options.workers,
+                options.chunk,
+                options.maxfail,
+                &options.extra_args,
+                &options.coverage_base,
+            ) {
+                break 'exec outcome;
+            }
+            eprintln!("cito: daemon unreachable; falling back to local workers");
+        }
+        match pool {
+            Some(pool) => pool.run(
+                files,
+                options.chunk,
+                options.maxfail,
+                purge,
+                &options.extra_args,
+                Some(&options.coverage_base),
+            ),
+            None => runner::run(
+                files,
+                options.workers,
+                options.chunk,
+                &options.python,
+                options.maxfail,
+                &options.extra_args,
+                Some(&options.coverage_base),
+            ),
+        }
     };
     print_summary(&outcome);
     combine_coverage(config, options);
@@ -498,6 +526,7 @@ pub fn run(
     pytest_args: Vec<String>,
     marker: Option<String>,
     changed_only: bool,
+    use_daemon: bool,
 ) -> ExitCode {
     let kexpr = match kexpr.as_deref().map(keyword::parse).transpose() {
         Ok(expr) => expr,
@@ -550,6 +579,10 @@ pub fn run(
             }
         }
     }
+    if use_daemon && !cfg!(unix) {
+        eprintln!("cito: --daemon is only supported on unix platforms");
+        return ExitCode::FAILURE;
+    }
     let options = RunOptions {
         workers: workers.unwrap_or_else(num_cpus::get),
         chunk,
@@ -557,8 +590,10 @@ pub fn run(
         maxfail,
         extra_args: pytest_args,
         coverage_base: config.rootdir.join(".coverage.cito").display().to_string(),
+        daemon: use_daemon,
     };
-    let pool = warm_workers.then(|| WarmPool::new(&options.python, options.workers));
+    let pool =
+        (warm_workers && !use_daemon).then(|| WarmPool::new(&options.python, options.workers));
     let collected: usize = files.iter().map(|f| f.tests.len()).sum();
     let outcome = run_once(files, &config, &options, pool.as_ref(), &[]);
     if json {
@@ -697,6 +732,59 @@ fn watch_loop(
         run_once(files, config, options, pool, &pending_purge);
         pending_purge.clear();
         eprintln!("cito: watching for changes (Ctrl-C to stop)");
+    }
+}
+
+fn daemon_rootdir() -> Config {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    Config::discover(&cwd)
+}
+
+pub fn daemon_command(action: &str) -> ExitCode {
+    #[cfg(not(unix))]
+    {
+        let _ = action;
+        eprintln!("cito: the daemon is only supported on unix platforms");
+        ExitCode::FAILURE
+    }
+    #[cfg(unix)]
+    {
+        let config = daemon_rootdir();
+        match action {
+            "serve" => match crate::daemon::serve(&config.rootdir) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("cito: daemon failed: {err}");
+                    ExitCode::FAILURE
+                }
+            },
+            "start" => match crate::daemon::ensure(&config.rootdir) {
+                Some(path) => {
+                    eprintln!("cito: daemon ready at {}", path.display());
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!("cito: failed to start daemon");
+                    ExitCode::FAILURE
+                }
+            },
+            "stop" => {
+                if crate::daemon::stop(&config.rootdir) {
+                    eprintln!("cito: daemon stopped");
+                } else {
+                    eprintln!("cito: no daemon running");
+                }
+                ExitCode::SUCCESS
+            }
+            "status" => {
+                match crate::daemon::status(&config.rootdir) {
+                    Some(version) => eprintln!("cito: daemon running (v{version})"),
+                    None => eprintln!("cito: no daemon running"),
+                }
+                ExitCode::SUCCESS
+            }
+            _ => ExitCode::FAILURE,
+        }
     }
 }
 

@@ -10,10 +10,11 @@ and [uv](https://github.com/astral-sh/uv) did for linting and packaging. It
 discovers your tests by parsing them with ruff's parser — in milliseconds, not
 seconds — and verifies against real pytest that it finds the same node IDs.
 
-> **Status: v0.1.** Collection is real, fast, and differential-tested against
-> pytest's own test suite and pandas'. The parallel runner (`cito run`,
-> `--warm`) is a working preview. Not yet production-ready; the compatibility
-> contract below is the plan for getting there.
+> **Status: v0.2.** Collection is differential-tested against pytest's own
+> suite, pandas, flask, rich, and 100 fuzz seeds. The runner does parallel
+> subprocesses, warm in-process workers, and a per-project daemon that makes
+> one-shot runs ~0.02 s. Not yet 1.0; the compatibility contract below is
+> the map.
 
 ## Benchmarks
 
@@ -79,6 +80,9 @@ $ cito run -- --cov=mypkg         # pass anything through to pytest; parallel
                                   # coverage fragments are combined for you
 $ cito run -m "not slow"          # mark expressions, filtered at collection time
 $ cito run --changed              # only files whose content changed since last run
+$ cito run --daemon               # hit the per-project warm daemon: one-shot
+                                  # runs in ~0.02s (auto-starts; unix)
+$ cito daemon status              # start | stop | status
 ```
 
 - **Configuration discovery**: `pytest.ini`, `pyproject.toml` (`[tool.pytest]`
@@ -150,14 +154,14 @@ Known gaps, tracked honestly:
   `collect_ignore` / `collect_ignore_glob` lists in conftest.py ARE
   supported; computed appends are not)
 
-## Architecture (where this is going)
+## Architecture
 
-1. **v0.1 — collection parity + speed** (you are here).
-2. **v0.2 — warm workers, properly**: a daemon holding pre-imported CPython
-   workers; Rust owns discovery, scheduling, caching, and reporting. First
-   cut ships behind `cito run --warm`.
-3. **v0.3 — scheduling wins**: failed-first, changed-first (AST diff),
-   `--watch`, machine-readable output for agents and CI.
+1. **v0.1 — collection parity + speed**: shipped.
+2. **v0.2 — warm workers**: shipped — `--warm` pools within a run, `--watch`
+   keeps them across saves, and `cito run --daemon` keeps them across CLI
+   invocations (workers self-purge modules whose files changed).
+3. **v0.3 — scheduling**: mostly shipped (failed-first, content-changed-first,
+   `--lf`, `--changed`, `--json`); remaining: AST-level impact analysis.
 4. **Plugin compatibility matrix**: explicit, tested support for the top-20
    pytest plugins (xdist, cov, asyncio, django, hypothesis, mock, ...).
 
