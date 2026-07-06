@@ -75,6 +75,8 @@ $ cito run --watch --warm         # live loop: warm workers survive across saves
 $ cito run -k "http and not slow" # keyword expressions
 $ cito run -x                     # stop at first failure (--maxfail N)
 $ cito run --json                 # machine-readable summary for agents/CI
+$ cito run -- --cov=mypkg         # pass anything through to pytest; parallel
+                                  # coverage fragments are combined for you
 ```
 
 - **Configuration discovery**: `pytest.ini`, `pyproject.toml` (`[tool.pytest]`

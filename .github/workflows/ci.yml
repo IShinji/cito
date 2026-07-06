@@ -16,8 +16,7 @@ jobs:
         include:
           - { os: ubuntu-latest, experimental: false }
           - { os: macos-14, experimental: false }
-          # Windows is untested territory; failures are informative, not blocking.
-          - { os: windows-latest, experimental: true }
+          - { os: windows-latest, experimental: false }
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     steps:

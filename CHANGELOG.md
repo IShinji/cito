@@ -19,6 +19,10 @@ Initial release.
 - `--python` probe for module-level `pytest.importorskip` requirements.
 - `cito run`: parallel execution across pytest subprocesses; `--warm` keeps
   workers alive across chunks (`pytest.main()` in-process).
+- `--` passthrough of arbitrary pytest args to every chunk; parallel-safe
+  coverage: each chunk gets its own COVERAGE_FILE and fragments are
+  auto-combined into `.coverage` after the run (verified: 2-chunk run of a
+  2-function module reports 100%). Windows CI promoted to blocking.
 - `cito run --json` (machine-readable summary), pytest-compatible exit
   code 5 when nothing is collected, `-k` on collect, conftest
   `collect_ignore`/`collect_ignore_glob` (literal lists), `.cito/` cache

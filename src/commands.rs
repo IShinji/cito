@@ -318,6 +318,46 @@ struct RunOptions {
     chunk: usize,
     python: String,
     maxfail: usize,
+    extra_args: Vec<String>,
+    coverage_base: String,
+}
+
+/// If any per-chunk coverage files were produced (the runners point
+/// pytest-cov at `.coverage.cito.N`), merge them into the standard
+/// `.coverage` so `coverage report` works as usual.
+fn combine_coverage(config: &Config, options: &RunOptions) {
+    let Ok(entries) = std::fs::read_dir(&config.rootdir) else {
+        return;
+    };
+    let fragments: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".coverage.cito."))
+        })
+        .collect();
+    if fragments.is_empty() {
+        return;
+    }
+    let status = std::process::Command::new(&options.python)
+        .args(["-m", "coverage", "combine"])
+        .args(&fragments)
+        .current_dir(&config.rootdir)
+        .output();
+    match status {
+        Ok(out) if out.status.success() => {
+            eprintln!(
+                "cito: combined {} coverage fragment(s) into .coverage",
+                fragments.len()
+            );
+        }
+        _ => eprintln!(
+            "cito: warning: {} coverage fragment(s) left uncombined (is `coverage` installed?)",
+            fragments.len()
+        ),
+    }
 }
 
 /// Order, run, report, and update the last-failed cache. Returns the outcome.
@@ -342,16 +382,26 @@ fn run_once(
         options.workers
     );
     let outcome = match pool {
-        Some(pool) => pool.run(files, options.chunk, options.maxfail, purge),
+        Some(pool) => pool.run(
+            files,
+            options.chunk,
+            options.maxfail,
+            purge,
+            &options.extra_args,
+            Some(&options.coverage_base),
+        ),
         None => runner::run(
             files,
             options.workers,
             options.chunk,
             &options.python,
             options.maxfail,
+            &options.extra_args,
+            Some(&options.coverage_base),
         ),
     };
     print_summary(&outcome);
+    combine_coverage(config, options);
     if outcome.skipped_chunks > 0 {
         eprintln!(
             "cito: stopped early (--maxfail): {} chunk(s) not run",
@@ -374,6 +424,7 @@ pub fn run(
     maxfail: usize,
     kexpr: Option<String>,
     json: bool,
+    pytest_args: Vec<String>,
 ) -> ExitCode {
     let kexpr = match kexpr.as_deref().map(keyword::parse).transpose() {
         Ok(expr) => expr,
@@ -403,6 +454,8 @@ pub fn run(
         chunk,
         python,
         maxfail,
+        extra_args: pytest_args,
+        coverage_base: config.rootdir.join(".coverage.cito").display().to_string(),
     };
     let pool = warm_workers.then(|| WarmPool::new(&options.python, options.workers));
     let collected: usize = files.iter().map(|f| f.tests.len()).sum();

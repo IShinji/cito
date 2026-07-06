@@ -16,11 +16,13 @@ use crate::runner::{make_chunks, report_chunk, Counts, Outcome};
 /// file paths evicts stale modules before running — required when the pool
 /// outlives file edits (watch mode).
 const WORKER_SHIM: &str = r#"
-import contextlib, importlib, io, json, sys
+import contextlib, importlib, io, json, os, sys
 import pytest
 
 for line in sys.stdin:
     req = json.loads(line)
+    for key, value in (req.get("env") or {}).items():
+        os.environ[key] = value
     purge = req.get("purge") or ()
     if purge:
         targets = set(purge)
@@ -76,8 +78,13 @@ impl Worker {
     }
 
     /// Send one chunk; None means the worker died (its chunk is lost).
-    fn run_chunk(&mut self, args: &[String], purge: &[String]) -> Option<Reply> {
-        let request = serde_json::json!({ "args": args, "purge": purge });
+    fn run_chunk(
+        &mut self,
+        args: &[String],
+        purge: &[String],
+        env: &serde_json::Value,
+    ) -> Option<Reply> {
+        let request = serde_json::json!({ "args": args, "purge": purge, "env": env });
         writeln!(self.stdin, "{request}").ok()?;
         let mut line = String::new();
         match self.stdout.read_line(&mut line) {
@@ -117,6 +124,8 @@ impl WarmPool {
         chunk_size: usize,
         maxfail: usize,
         purge: &[String],
+        extra_args: &[String],
+        coverage_base: Option<&str>,
     ) -> Outcome {
         let chunks = make_chunks(&files, chunk_size);
         let total = chunks.len();
@@ -125,6 +134,7 @@ impl WarmPool {
         let skipped = Mutex::new(0usize);
         let totals = Mutex::new(Counts::default());
         let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let chunk_seq = std::sync::atomic::AtomicUsize::new(0);
         let start = Instant::now();
         std::thread::scope(|scope| {
             for slot in &self.workers {
@@ -146,9 +156,18 @@ impl WarmPool {
                             "--no-header".to_string(),
                             "-rfE".to_string(),
                         ];
+                        args.extend(extra_args.iter().cloned());
                         args.extend(ids);
+                        let env = match coverage_base {
+                            Some(base) => {
+                                let seq =
+                                    chunk_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                serde_json::json!({ "COVERAGE_FILE": format!("{base}.{seq}") })
+                            }
+                            None => serde_json::Value::Null,
+                        };
                         let (chunk_failed, counts, ids_failed) = match worker
-                            .run_chunk(&args, purge)
+                            .run_chunk(&args, purge, &env)
                         {
                             Some(reply) => report_chunk(Some(reply.code), &reply.output, ""),
                             None => {

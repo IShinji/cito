@@ -72,6 +72,10 @@ enum Command {
         /// Print a machine-readable JSON summary to stdout after the run.
         #[arg(long, conflicts_with = "watch")]
         json: bool,
+        /// Extra arguments passed through to every pytest invocation
+        /// (e.g. `cito run -- --cov=mypkg --tb=short`).
+        #[arg(last = true)]
+        pytest_args: Vec<String>,
     },
 }
 
@@ -97,10 +101,21 @@ fn main() -> ExitCode {
             fail_fast,
             keyword,
             json,
+            pytest_args,
         } => {
             let maxfail = if fail_fast { 1 } else { maxfail };
             cito::commands::run(
-                paths, workers, chunk, python, warm, lf, watch, maxfail, keyword, json,
+                paths,
+                workers,
+                chunk,
+                python,
+                warm,
+                lf,
+                watch,
+                maxfail,
+                keyword,
+                json,
+                pytest_args,
             )
         }
     }

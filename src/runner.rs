@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -116,6 +117,8 @@ pub fn run(
     chunk_size: usize,
     python: &str,
     maxfail: usize,
+    extra_args: &[String],
+    coverage_base: Option<&str>,
 ) -> Outcome {
     let chunks = make_chunks(&files, chunk_size);
     let total = chunks.len();
@@ -124,6 +127,7 @@ pub fn run(
     let skipped = Mutex::new(0usize);
     let totals = Mutex::new(Counts::default());
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let chunk_seq = AtomicUsize::new(0);
     let start = Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..workers.max(1) {
@@ -131,10 +135,18 @@ pub fn run(
                 let Some(ids) = queue.lock().expect("queue lock").pop_front() else {
                     break;
                 };
-                let output = Command::new(python)
+                let mut command = Command::new(python);
+                command
                     .args(["-m", "pytest", "-q", "--no-header", "-rfE"])
-                    .args(&ids)
-                    .output();
+                    .args(extra_args)
+                    .args(&ids);
+                if let Some(base) = coverage_base {
+                    // Unique per chunk so parallel pytest-cov runs never
+                    // clobber each other; combined after the run.
+                    let seq = chunk_seq.fetch_add(1, Ordering::Relaxed);
+                    command.env("COVERAGE_FILE", format!("{base}.{seq}"));
+                }
+                let output = command.output();
                 let (chunk_failed, counts, ids_failed) = match output {
                     Ok(out) => report_chunk(
                         out.status.code(),
