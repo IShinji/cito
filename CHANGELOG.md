@@ -4,6 +4,12 @@
 
 Initial release.
 
+- Validation-matrix findings, all fixed and locked in by
+  `scripts/validate_repos.py` (click, jinja2, attrs, httpx, starlette,
+  urllib3 — all exact): quote-aware `addopts` splitting with `-m`/`-k`
+  honored as defaults; `@pytest.fixture(name=...)` registration names;
+  anyio plugin backend parametrization detection (mark + well-known fixture
+  names); collection of test classes/functions imported into test modules.
 - **Per-project warm daemon** (`cito daemon start|stop|status`,
   `cito run --daemon`, unix): workers keep pytest and conftest imported
   across CLI invocations — a one-shot `cito run` on a warm daemon completes

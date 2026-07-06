@@ -250,6 +250,9 @@ pub struct FixtureFlags {
     /// `autouse=` fixtures apply to every test in scope; a parametrized
     /// autouse fixture invalidates all exact expansions in that scope.
     pub autouse: bool,
+    /// `@pytest.fixture(name="public")` registers under this name instead
+    /// of the function's own name.
+    pub name: Option<String>,
 }
 
 /// Is this decorator list a `@pytest.fixture` (optionally with arguments)?
@@ -270,9 +273,17 @@ pub fn fixture_info(decorators: &[ast::Decorator]) -> Option<FixtureFlags> {
                     .iter()
                     .any(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == name))
             };
+            let name = keywords
+                .iter()
+                .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "name"))
+                .and_then(|k| match &k.value {
+                    Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
+                    _ => None,
+                });
             return Some(FixtureFlags {
                 parametrized: has_kwarg("params"),
                 autouse: has_kwarg("autouse"),
+                name,
             });
         }
     }

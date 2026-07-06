@@ -92,6 +92,7 @@ struct Module {
     imports: HashMap<String, Import>,
     star_imports: Vec<ModuleRef>,
     classes: HashMap<String, Class>,
+    functions: HashMap<String, TestDef>,
     fixtures: HashMap<String, Fixture>,
     order: Vec<TopItem>,
     /// Module names demanded via module-level `pytest.importorskip(...)`.
@@ -133,6 +134,15 @@ fn requests_parametrized_fixture(
     while let Some(name) = queue.pop() {
         if !seen.insert(name) {
             continue;
+        }
+        // The anyio plugin's backend fixtures are parametrized by the
+        // plugin itself; reaching one (directly or transitively) means the
+        // plugin will add ID pieces we cannot see.
+        if matches!(
+            name,
+            "anyio_backend" | "anyio_backend_name" | "anyio_backend_options"
+        ) {
+            return true;
         }
         if let Some(fixture) = lookup(name) {
             if fixture.parametrized {
@@ -270,6 +280,7 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
         imports: HashMap::new(),
         star_imports: Vec::new(),
         classes: HashMap::new(),
+        functions: HashMap::new(),
         fixtures: HashMap::new(),
         order: Vec::new(),
         skip_requires: Vec::new(),
@@ -300,8 +311,9 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                 }
                 // Fixtures are never collected as tests, even test-named ones.
                 if let Some(flags) = params::fixture_info(&func.decorator_list) {
+                    let key = flags.name.unwrap_or_else(|| func.name.to_string());
                     module.fixtures.insert(
-                        func.name.to_string(),
+                        key,
                         Fixture {
                             parametrized: flags.parametrized,
                             autouse: flags.autouse,
@@ -310,7 +322,9 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                     );
                     continue;
                 }
-                module.order.push(TopItem::Func(test_def(func, aliases)));
+                let def = test_def(func, aliases);
+                module.functions.insert(def.name.clone(), def.clone());
+                module.order.push(TopItem::Func(def));
             }
             Stmt::ClassDef(class) if top => {
                 let name = class.name.to_string();
@@ -448,8 +462,9 @@ fn build_class(class: &ast::StmtClassDef, aliases: &params::ParamAliases) -> Cla
                     has_ctor = true;
                 }
                 if let Some(flags) = params::fixture_info(&func.decorator_list) {
+                    let key = flags.name.unwrap_or_else(|| name.to_string());
                     fixtures.insert(
-                        name.to_string(),
+                        key,
                         Fixture {
                             parametrized: flags.parametrized,
                             autouse: flags.autouse,
@@ -720,6 +735,32 @@ print(json.dumps(result))
                     }
                     return None;
                 }
+            }
+        }
+        None
+    }
+
+    /// Like resolve_symbol, but a name defined as a top-level function in
+    /// the target module also terminates the chase.
+    fn resolve_symbol_or_function(
+        &mut self,
+        mut module: Rc<Module>,
+        mut name: String,
+    ) -> Option<(Rc<Module>, String)> {
+        for _ in 0..8 {
+            if module.classes.contains_key(&name) || module.functions.contains_key(&name) {
+                return Some((module, name));
+            }
+            match module.imports.get(&name).cloned() {
+                Some(Import::From(mref, orig)) => {
+                    if is_unittest_ref(&mref, &orig) {
+                        return None;
+                    }
+                    let next = self.resolve_ref(&mref, &module.dir.clone())?;
+                    module = next;
+                    name = orig;
+                }
+                _ => return None,
             }
         }
         None
@@ -1008,13 +1049,13 @@ fn emit_module(
         match item {
             TopItem::Func(def) => {
                 if resolver.config.function_matches(&def.name) {
+                    let names: HashSet<String> = module
+                        .pytestmark
+                        .iter()
+                        .chain(def.marks.iter())
+                        .cloned()
+                        .collect();
                     if let Some(expr) = marker {
-                        let names: HashSet<String> = module
-                            .pytestmark
-                            .iter()
-                            .chain(def.marks.iter())
-                            .cloned()
-                            .collect();
                         if !expr.matches_names(&names) {
                             continue;
                         }
@@ -1026,7 +1067,11 @@ fn emit_module(
                     } else {
                         def.expansion.clone()
                     };
-                    if poisoned && matches!(expansion, Expansion::Params(_)) {
+                    // The anyio plugin parametrizes marked tests with the
+                    // backend fixture, adding ID pieces we cannot see.
+                    if (poisoned || names.contains("anyio"))
+                        && matches!(expansion, Expansion::Params(_))
+                    {
                         expansion = Expansion::Fallback;
                     }
                     tests.extend(expansion.apply(&def.name));
@@ -1042,11 +1087,89 @@ fn emit_module(
                     class,
                     name,
                     &contexts,
+                    &module.pytestmark,
                     poisoned,
                     marker,
                     &mut Vec::new(),
                     &mut tests,
                 );
+            }
+        }
+    }
+
+    // pytest collects over the module NAMESPACE: test classes/functions
+    // *imported* into a test module are collected here too (the classic
+    // urllib3 contrib pattern: `from ..test_https import TestHTTPS`).
+    let mut imported: Vec<(String, Rc<Module>, String)> = Vec::new(); // (local, module, original)
+    for (local, import) in &module.imports {
+        let Import::From(mref, orig) = import else {
+            continue;
+        };
+        let looks_like_class = resolver.config.class_matches(local);
+        let looks_like_func = resolver.config.function_matches(local);
+        if !looks_like_class && !looks_like_func {
+            continue;
+        }
+        if module.classes.contains_key(local) || module.functions.contains_key(local) {
+            continue; // a local definition shadows the import
+        }
+        if is_unittest_ref(mref, orig) {
+            continue;
+        }
+        if let Some(target) = resolver.resolve_ref(mref, &module.dir) {
+            imported.push((local.clone(), target, orig.clone()));
+        }
+    }
+    imported.sort_by(|a, b| a.0.cmp(&b.0));
+    for (local, target, orig) in imported {
+        let Some((target, orig)) = resolver.resolve_symbol_or_function(target, orig) else {
+            continue;
+        };
+        if resolver.config.class_matches(&local) {
+            if let Some(class) = target.classes.get(&orig) {
+                emit_class(
+                    resolver,
+                    &target.clone(),
+                    class,
+                    &local,
+                    &contexts,
+                    &module.pytestmark,
+                    poisoned,
+                    marker,
+                    &mut Vec::new(),
+                    &mut tests,
+                );
+                continue;
+            }
+        }
+        if resolver.config.function_matches(&local) {
+            if let Some(def) = target.functions.get(&orig) {
+                let names: HashSet<String> = module
+                    .pytestmark
+                    .iter()
+                    .chain(def.marks.iter())
+                    .cloned()
+                    .collect();
+                if let Some(expr) = marker {
+                    if !expr.matches_names(&names) {
+                        continue;
+                    }
+                }
+                let mut expansion = if def.expansion != Expansion::None
+                    && requests_parametrized_fixture(&contexts, &[], def)
+                {
+                    Expansion::Fallback
+                } else {
+                    def.expansion.clone()
+                };
+                if (poisoned || names.contains("anyio"))
+                    && matches!(expansion, Expansion::Params(_))
+                {
+                    expansion = Expansion::Fallback;
+                }
+                for id in expansion.apply(&local) {
+                    tests.push(id);
+                }
             }
         }
     }
@@ -1060,6 +1183,7 @@ fn emit_class(
     class: &Class,
     name: &str,
     contexts: &[Rc<Module>],
+    pytestmark: &[String],
     poisoned: bool,
     marker: Option<&crate::keyword::KExpr>,
     stack: &mut Vec<String>,
@@ -1093,26 +1217,29 @@ fn emit_class(
         if !matches {
             continue;
         }
+        let names: HashSet<String> = pytestmark
+            .iter()
+            .chain(chain_marks.iter())
+            .chain(def.marks.iter())
+            .cloned()
+            .collect();
         if let Some(expr) = marker {
-            let names: HashSet<String> = module
-                .pytestmark
-                .iter()
-                .chain(chain_marks.iter())
-                .chain(def.marks.iter())
-                .cloned()
-                .collect();
             if !expr.matches_names(&names) {
                 continue;
             }
         }
         // Any exact expansion — the method's own or one applied by the
         // class — is invalid if the test requests a parametrized fixture
-        // (leaf-module visibility applies to inherited methods too).
+        // (leaf-module visibility applies to inherited methods too), or if
+        // the anyio plugin will parametrize it via its backend fixture.
         let mut combined = Expansion::combine(&class_expansion, &def.expansion);
         if matches!(combined, Expansion::Params(_)) {
             let mut request = def.clone();
             request.args.extend(class.usefixtures.iter().cloned());
-            if poisoned || requests_parametrized_fixture(contexts, &[&chain_fixtures], &request) {
+            if poisoned
+                || names.contains("anyio")
+                || requests_parametrized_fixture(contexts, &[&chain_fixtures], &request)
+            {
                 combined = Expansion::Fallback;
             }
         }
@@ -1128,6 +1255,7 @@ fn emit_class(
                 nested_class,
                 nested_name,
                 contexts,
+                pytestmark,
                 poisoned,
                 marker,
                 stack,

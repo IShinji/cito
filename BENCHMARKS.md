@@ -38,6 +38,13 @@ is a documented gap), 0 extras. This suite exercises pytest's own config
 `python_classes`), decorator aliases, parametrized/autouse fixtures, and
 `pytest_generate_tests` — the most hostile static-analysis target available.
 
+### Validation matrix (release gate)
+
+`scripts/validate_repos.py` diff-checks a matrix of real repositories at the
+tags matching the installed wheels. As of v0.2: click (1,686 IDs), jinja2
+(909), attrs (1,386), httpx (1,418), starlette (981), urllib3 (2,273) — all
+exact, zero missing, zero extras.
+
 ### flask 3.1.3 and rich 15.0.0
 
 Source checkouts at the tags matching the installed wheels, pytest 8.4.2

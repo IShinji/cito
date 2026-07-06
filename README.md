@@ -35,6 +35,17 @@ And the part that matters more than speed — **the same answers**:
 | pandas 3.0.3 | 197,077 | 26 (0.013%) | 2 |
 | flask 3.1.3 | 482 | 0 | 0 |
 | rich 15.0.0 | 981 | 0 | 0 |
+| click 8.4.2 | 1,686 | 0 | 0 |
+| jinja2 3.1.6 | 909 | 0 | 0 |
+| attrs 26.1.0 | 1,386 | 0 | 0 |
+| httpx 0.28.1 | 1,418 | 0 | 0 |
+| starlette 1.3.1 | 981 | 0 | 0 |
+| urllib3 2.7.0 | 2,273 | 0 | 0 |
+
+(`scripts/validate_repos.py` reruns the whole matrix against fresh clones —
+the release gate. sqlalchemy and django are documented out: their suites
+require project-specific collection-bootstrap plugins that no static tool
+can see.)
 
 `scripts/diff_collect.py` computes this equivalence on every CI run.
 
@@ -124,8 +135,13 @@ $ cito daemon status              # start | stop | status
   their parametrizations.
 - **Mark expressions**: `-m "not slow"` filters on statically-harvested
   marks (function, class chain, and module `pytestmark`) *at collection
-  time* — deselected tests are never scheduled at all. Per-parametrize
+  time* — deselected tests are never scheduled at all. `-m`/`-k` inside
+  config `addopts` are honored (CLI wins). Per-parametrize
   `pytest.param(marks=...)` marks are not filtered (approximation).
+- **Namespace collection**: test classes/functions *imported* into a test
+  module are collected there too (the urllib3-contrib rerun pattern);
+  `@pytest.fixture(name=...)` renames are tracked; anyio's plugin-injected
+  backend parametrization is detected and falls back safely.
 
 ## The compatibility contract
 

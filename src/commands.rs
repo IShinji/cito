@@ -142,25 +142,33 @@ struct Collected {
     files: Vec<collector::FileTests>,
     roots: Vec<PathBuf>,
     config: Config,
+    marker: Option<keyword::KExpr>,
 }
 
+/// CLI `-m` wins over an `-m` inside config addopts (pytest prepends
+/// addopts, so a later CLI flag overrides it).
 fn collect_files(
     paths: Vec<PathBuf>,
     probe_python: Option<&str>,
-    marker: Option<&keyword::KExpr>,
-) -> Collected {
+    marker_cli: Option<String>,
+) -> Result<Collected, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (root_args, selectors) = parse_selections(paths, &cwd);
     let anchor = discovery_anchor(&root_args, &cwd);
     let config = Config::discover(&anchor);
+    let marker = marker_cli
+        .or_else(|| config.addopts_flag("-m"))
+        .map(|m| keyword::parse(&m).map_err(|e| format!("invalid -m expression: {e}")))
+        .transpose()?;
     let roots = resolve_roots(root_args, &config, &cwd);
-    let mut files = collector::collect(&roots, &config, probe_python, marker);
+    let mut files = collector::collect(&roots, &config, probe_python, marker.as_ref());
     apply_selectors(&mut files, &selectors);
-    Collected {
+    Ok(Collected {
         files,
         roots,
         config,
-    }
+        marker,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -323,21 +331,25 @@ pub fn collect(
     kexpr: Option<String>,
     marker: Option<String>,
 ) -> ExitCode {
-    let kexpr = match kexpr.as_deref().map(keyword::parse).transpose() {
+    let Collected {
+        mut files, config, ..
+    } = match collect_files(paths, python.as_deref(), marker) {
+        Ok(collected) => collected,
+        Err(err) => {
+            eprintln!("cito: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let kexpr = kexpr
+        .or_else(|| config.addopts_flag("-k"))
+        .map(|k| keyword::parse(&k));
+    let kexpr = match kexpr.transpose() {
         Ok(expr) => expr,
         Err(err) => {
             eprintln!("cito: invalid -k expression: {err}");
             return ExitCode::FAILURE;
         }
     };
-    let marker = match marker.as_deref().map(keyword::parse).transpose() {
-        Ok(expr) => expr,
-        Err(err) => {
-            eprintln!("cito: invalid -m expression: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let Collected { mut files, .. } = collect_files(paths, python.as_deref(), marker.as_ref());
     if let Some(expr) = &kexpr {
         apply_keyword(&mut files, expr);
     }
@@ -528,25 +540,28 @@ pub fn run(
     changed_only: bool,
     use_daemon: bool,
 ) -> ExitCode {
-    let kexpr = match kexpr.as_deref().map(keyword::parse).transpose() {
+    let Collected {
+        mut files,
+        roots,
+        config,
+        marker,
+    } = match collect_files(paths, Some(&python), marker) {
+        Ok(collected) => collected,
+        Err(err) => {
+            eprintln!("cito: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let kexpr = kexpr
+        .or_else(|| config.addopts_flag("-k"))
+        .map(|k| keyword::parse(&k));
+    let kexpr = match kexpr.transpose() {
         Ok(expr) => expr,
         Err(err) => {
             eprintln!("cito: invalid -k expression: {err}");
             return ExitCode::FAILURE;
         }
     };
-    let marker = match marker.as_deref().map(keyword::parse).transpose() {
-        Ok(expr) => expr,
-        Err(err) => {
-            eprintln!("cito: invalid -m expression: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let Collected {
-        mut files,
-        roots,
-        config,
-    } = collect_files(paths, Some(&python), marker.as_ref());
     if config
         .addopts
         .iter()

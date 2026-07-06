@@ -100,6 +100,32 @@ fn defaults(patterns: &[&str]) -> Vec<String> {
     patterns.iter().map(|s| s.to_string()).collect()
 }
 
+/// Quote-aware splitting for `addopts = "-m 'not stress'"` style values.
+fn shell_split(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for c in input.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        out.push(std::mem::take(&mut current));
+                    }
+                }
+                c => current.push(c),
+            },
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
 impl Config {
     pub fn discover(start: &Path) -> Config {
         let start = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
@@ -173,6 +199,23 @@ impl Config {
     pub fn relative_to_root<'a>(&self, abs: &'a Path) -> Option<&'a Path> {
         abs.strip_prefix(&self.rootdir).ok()
     }
+
+    /// The value of a flag inside addopts (`-m X`, `-m=X`); last one wins,
+    /// mirroring how pytest prepends addopts to the CLI.
+    pub fn addopts_flag(&self, flag: &str) -> Option<String> {
+        let mut found = None;
+        let mut iter = self.addopts.iter();
+        while let Some(arg) = iter.next() {
+            if arg == flag {
+                if let Some(value) = iter.next() {
+                    found = Some(value.clone());
+                }
+            } else if let Some(rest) = arg.strip_prefix(&format!("{flag}=")) {
+                found = Some(rest.to_string());
+            }
+        }
+        found
+    }
 }
 
 /// Return `(config file, options)` if `dir` holds a pytest config, honoring
@@ -224,6 +267,7 @@ fn pyproject_options(text: &str) -> Option<HashMap<String, Vec<String>>> {
     let mut options = HashMap::new();
     for (key, value) in table {
         let values = match value {
+            toml::Value::String(s) if key == "addopts" => shell_split(s),
             toml::Value::String(s) => s.split_whitespace().map(str::to_string).collect(),
             toml::Value::Array(items) => items
                 .iter()
@@ -283,7 +327,14 @@ fn ini_section(text: &str, section: &str) -> Option<HashMap<String, Vec<String>>
     Some(
         values
             .into_iter()
-            .map(|(k, v)| (k, v.split_whitespace().map(str::to_string).collect()))
+            .map(|(k, v)| {
+                let split = if k == "addopts" {
+                    shell_split(&v)
+                } else {
+                    v.split_whitespace().map(str::to_string).collect()
+                };
+                (k, split)
+            })
             .collect(),
     )
 }
