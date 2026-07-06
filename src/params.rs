@@ -326,9 +326,7 @@ fn parametrize_pieces(call: &ast::ExprCall) -> Option<Vec<String>> {
     // `ids=` overrides piece rendering entirely; if present but not fully
     // resolvable/safe, the whole decorator must fall back.
     if let Some(ids_value) = ids_kwarg(call) {
-        let Some(elts) = elements(ids_value) else {
-            return None;
-        };
+        let elts = elements(ids_value)?;
         let ids: Option<Vec<String>> = elts
             .iter()
             .map(|e| match e {
