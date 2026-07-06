@@ -141,6 +141,7 @@ fn collect_files(
     paths: Vec<PathBuf>,
     probe_python: Option<&str>,
     marker_cli: Option<String>,
+    ignore: &[PathBuf],
 ) -> Result<Collected, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (root_args, selectors) = parse_selections(paths, &cwd);
@@ -151,7 +152,21 @@ fn collect_files(
         .map(|m| keyword::parse(&m).map_err(|e| format!("invalid -m expression: {e}")))
         .transpose()?;
     let roots = resolve_roots(root_args, &config, &cwd);
+    let ignored: Vec<PathBuf> = ignore
+        .iter()
+        .map(|p| {
+            let abs = if p.is_absolute() {
+                p.clone()
+            } else {
+                cwd.join(p)
+            };
+            abs.canonicalize().unwrap_or(abs)
+        })
+        .collect();
     let mut files = collector::collect(&roots, &config, probe_python, marker.as_ref());
+    if !ignored.is_empty() {
+        files.retain(|f| !ignored.iter().any(|ig| f.abs_path.starts_with(ig)));
+    }
     apply_selectors(&mut files, &selectors);
     Ok(Collected {
         files,
@@ -313,6 +328,7 @@ fn write_lastfailed(
 // Commands
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub fn collect(
     paths: Vec<PathBuf>,
     json: bool,
@@ -320,10 +336,11 @@ pub fn collect(
     python: Option<String>,
     kexpr: Option<String>,
     marker: Option<String>,
+    ignore: Vec<PathBuf>,
 ) -> ExitCode {
     let Collected {
         mut files, config, ..
-    } = match collect_files(paths, python.as_deref(), marker) {
+    } = match collect_files(paths, python.as_deref(), marker, &ignore) {
         Ok(collected) => collected,
         Err(err) => {
             eprintln!("cito: {err}");
@@ -527,6 +544,7 @@ pub fn run(
     json: bool,
     pytest_args: Vec<String>,
     marker: Option<String>,
+    ignore: Vec<PathBuf>,
     changed_only: bool,
     use_daemon: bool,
 ) -> ExitCode {
@@ -535,7 +553,7 @@ pub fn run(
         roots,
         config,
         marker,
-    } = match collect_files(paths, Some(&python), marker) {
+    } = match collect_files(paths, Some(&python), marker, &ignore) {
         Ok(collected) => collected,
         Err(err) => {
             eprintln!("cito: {err}");

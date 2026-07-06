@@ -37,6 +37,9 @@ enum Command {
         /// Only list tests matching this mark expression (e.g. "not slow").
         #[arg(short = 'm')]
         marker: Option<String>,
+        /// Ignore this file or directory during collection (repeatable).
+        #[arg(long = "ignore")]
+        ignore: Vec<PathBuf>,
     },
     /// Run tests by fanning collected node IDs out across pytest processes (experimental).
     Run {
@@ -78,6 +81,9 @@ enum Command {
         /// Only run tests matching this mark expression (e.g. "not slow").
         #[arg(short = 'm')]
         marker: Option<String>,
+        /// Ignore this file or directory during collection (repeatable).
+        #[arg(long = "ignore")]
+        ignore: Vec<PathBuf>,
         /// Only run files whose content changed since the last run.
         #[arg(long)]
         changed: bool,
@@ -107,7 +113,8 @@ fn main() -> ExitCode {
             python,
             keyword,
             marker,
-        } => cito::commands::collect(paths, json, count, python, keyword, marker),
+            ignore,
+        } => cito::commands::collect(paths, json, count, python, keyword, marker, ignore),
         Command::Run {
             paths,
             workers,
@@ -122,6 +129,7 @@ fn main() -> ExitCode {
             json,
             pytest_args,
             marker,
+            ignore,
             changed,
             daemon,
         } => {
@@ -139,6 +147,7 @@ fn main() -> ExitCode {
                 json,
                 pytest_args,
                 marker,
+                ignore,
                 changed,
                 daemon,
             )

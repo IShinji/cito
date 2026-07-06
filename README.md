@@ -52,6 +52,12 @@ And the part that matters more than speed — **the same answers**:
 | fastapi 0.139.0 | 3,317 | 0 | 0 |
 | sympy 1.14.0 | 13,657 | 0 | 16 (0.1%: custom @SKIP import-time machinery) |
 | typer 0.26.8 | 1,379 | 0 | 0 |
+| networkx 3.6.1 | 7,100 | 0 | 0 |
+| cryptography 49.0.0 | 4,472 | 0 | 0 |
+| django-rest-framework 3.17.1 | 1,552 | 0 | 0 |
+| sqlglot 30.12.0 | 1,127 | 0 | 0 |
+| pytest-asyncio 1.4.0 | 299 | 0 | 0 |
+| numpy 3.x wheel (site-packages) | 49,443 | 760 (1.5%: `type()` loop-generated SIMD classes) | 0 |
 | trio 0.33.0 | 895 | 0 | 0 |
 | pillow 12.3.0 | 5,218 | 0 | 0 |
 | aiohttp 3.14.1 | 4,364 | 0 | 0 |

@@ -11,6 +11,7 @@ Prints one summary line per repo and exits nonzero if any repo regresses.
 
 import argparse
 import importlib.metadata
+import os
 import pathlib
 import subprocess
 import sys
@@ -45,6 +46,13 @@ MATRIX = [
 
     ("typer", "https://github.com/fastapi/typer", ["{v}", "v{v}"], [], [], 0),
     ("trio", "https://github.com/python-trio/trio", ["v{v}", "{v}"], [], [], 0),
+    ("djangorestframework", "https://github.com/encode/django-rest-framework", ["{v}", "v{v}"], [], [], 0),
+    ("networkx", "https://github.com/networkx/networkx", ["networkx-{v}", "{v}", "v{v}"], [], [], 0),
+    ("sqlglot", "https://github.com/tobymao/sqlglot", ["v{v}", "{v}"], [], [], 0),
+    ("cryptography", "https://github.com/pyca/cryptography", ["{v}", "v{v}"], [], [], 0),
+    # litestar: needs a pinned full dev environment (time_machine API drift
+    # etc.) — polars family.
+    ("pytest_asyncio", "https://github.com/pytest-dev/pytest-asyncio", ["v{v}", "{v}"], [], [], 0),
     # aiohttp: ~19 extras = marks applied dynamically by conftest hooks
     # (pytest_collection_modifyitems tagging whole directories) interacting
     # with addopts -m deselection.
@@ -72,8 +80,18 @@ def clone_at(url: str, templates: list, version: str, dest: pathlib.Path) -> boo
         return True
     for template in templates:
         tag = template.format(v=version, v_und=version.replace(".", "_"))
+        # Neutralize git-lfs (may be configured globally but not installed);
+        # LFS payloads are never needed for collection.
+        env = dict(os.environ, GIT_LFS_SKIP_SMUDGE="1")
         result = sh(
-            ["git", "clone", "-q", "--depth", "1", "--branch", tag, url, str(dest)]
+            [
+                "git",
+                "-c", "filter.lfs.smudge=",
+                "-c", "filter.lfs.process=",
+                "-c", "filter.lfs.required=false",
+                "clone", "-q", "--depth", "1", "--branch", tag, url, str(dest),
+            ],
+            env=env,
         )
         if result.returncode == 0:
             return True

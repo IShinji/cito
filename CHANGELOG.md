@@ -4,6 +4,13 @@
 
 Initial release.
 
+- Fourth validation wave: networkx 7,100, cryptography 4,472 (class-body
+  `test_x = factory(...)` assignments now emit as fallback methods),
+  django-rest-framework 1,552 (pytest-django), sqlglot 1,127 (exact-exact),
+  pytest-asyncio 299 — all zero-diff; numpy 49,443 via site-packages with
+  760 missing (import-time type() factories) and zero extras. New
+  pytest-compatible `--ignore` flag on collect/run; validate_repos clones
+  neutralize git-lfs filters.
 - Rootdir determination now mirrors pytest's `determine_setup` exactly
   (read from source): section-less pyproject.toml is only a last-resort
   anchor, `pytest.toml`/`.pytest.toml`/`.pytest.ini` are recognized, and

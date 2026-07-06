@@ -715,6 +715,25 @@ fn build_class(class: &ast::StmtClassDef, aliases: &params::ParamAliases) -> Cla
                     build_class(nested, aliases),
                 ));
             }
+            // `test_kat = generate_encrypt_test(...)`: factory-made test
+            // methods bound as class attributes (cryptography's idiom).
+            // Parametrization is invisible, so they emit as bare names.
+            Stmt::Assign(assign) => {
+                if let ([Expr::Name(target)], Expr::Call(_)) =
+                    (assign.targets.as_slice(), &*assign.value)
+                {
+                    items.push(ClassItem::Method(TestDef {
+                        name: target.id.to_string(),
+                        expansion: Expansion::Fallback,
+                        args: Vec::new(),
+                        claimed: Vec::new(),
+                        marks: Vec::new(),
+                        maybe_marks: Vec::new(),
+                        skips_module: false,
+                        returns_const: None,
+                    }));
+                }
+            }
             _ => {}
         }
     }
