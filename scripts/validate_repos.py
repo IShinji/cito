@@ -17,14 +17,27 @@ import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
-# (package, git url, tag templates, diff args, known-gap substrings)
+# (package, git url, tag templates, diff args, known-gap substrings, max_extra)
+# max_extra > 0 marks a documented-partial repo: zero missing required, but
+# up to that many extras tolerated (e.g. sympy's custom @SKIP machinery and
+# environment-conditional test definitions).
 MATRIX = [
-    ("click", "https://github.com/pallets/click", ["{v}", "v{v}"], [], []),
-    ("jinja2", "https://github.com/pallets/jinja", ["{v}", "v{v}"], [], []),
-    ("attrs", "https://github.com/python-attrs/attrs", ["{v}", "v{v}"], [], []),
-    ("httpx", "https://github.com/encode/httpx", ["{v}", "v{v}"], [], []),
-    ("starlette", "https://github.com/encode/starlette", ["{v}", "v{v}"], [], []),
-    ("urllib3", "https://github.com/urllib3/urllib3", ["{v}", "v{v}"], [], []),
+    ("click", "https://github.com/pallets/click", ["{v}", "v{v}"], [], [], 0),
+    ("jinja2", "https://github.com/pallets/jinja", ["{v}", "v{v}"], [], [], 0),
+    ("attrs", "https://github.com/python-attrs/attrs", ["{v}", "v{v}"], [], [], 0),
+    ("httpx", "https://github.com/encode/httpx", ["{v}", "v{v}"], [], [], 0),
+    ("starlette", "https://github.com/encode/starlette", ["{v}", "v{v}"], [], [], 0),
+    ("urllib3", "https://github.com/urllib3/urllib3", ["{v}", "v{v}"], [], [], 0),
+    ("werkzeug", "https://github.com/pallets/werkzeug", ["{v}", "v{v}"], [], [], 0),
+    ("requests", "https://github.com/psf/requests", ["v{v}", "{v}"], [], [], 0),
+    ("more_itertools", "https://github.com/more-itertools/more-itertools", ["v{v}", "{v}"], [], [], 0),
+    ("packaging", "https://github.com/pypa/packaging", ["{v}", "v{v}"], [], [], 0),
+    ("pluggy", "https://github.com/pytest-dev/pluggy", ["{v}", "v{v}"], [], [], 0),
+    ("tornado", "https://github.com/tornadoweb/tornado", ["v{v}", "{v}"], ["tornado/test"], [], 0),
+    ("black", "https://github.com/psf/black", ["{v}", "v{v}"], [], [], 0),
+    ("pydantic", "https://github.com/pydantic/pydantic", ["v{v}", "{v}"], [], [], 0),
+    ("fastapi", "https://github.com/fastapi/fastapi", ["{v}", "v{v}"], [], [], 0),
+    ("sympy", "https://github.com/sympy/sympy", ["sympy-{v}", "{v}"], [], [], 45),
     # Skipped by design (documented): sqlalchemy and django test suites
     # require their own collection-bootstrap plugins; pytest itself collects
     # nothing without them.
@@ -58,7 +71,7 @@ def main() -> int:
 
     only = {p for p in args.only.split(",") if p}
     failures = 0
-    for package, url, templates, extra, ignore in MATRIX:
+    for package, url, templates, extra, ignore, max_extra in MATRIX:
         if only and package not in only:
             continue
         probe = sh(
@@ -90,10 +103,19 @@ def main() -> int:
         result = sh(cmd)
         tail = (result.stdout.strip().splitlines() or ["(no output)"])[-2:]
         status = "OK  " if result.returncode == 0 else "FAIL"
-        if result.returncode != 0:
+        if result.returncode != 0 and max_extra:
+            import re as _re
+
+            summary = next(
+                (l for l in result.stdout.splitlines() if l.startswith("pytest=")), ""
+            )
+            m = _re.search(r"missing=(\d+) extra=(\d+)", summary)
+            if m and int(m.group(1)) == 0 and int(m.group(2)) <= max_extra:
+                status = "PART"
+        if status == "FAIL":
             failures += 1
         print(f"{package:12s} {status} {version:10s} {' | '.join(tail)}")
-        if result.returncode != 0:
+        if status == "FAIL":
             for line in result.stdout.strip().splitlines()[:6]:
                 print(f"    {line}")
     return 1 if failures else 0

@@ -60,6 +60,9 @@ pub struct DecoratorInfo {
     pub extra_fixture_requests: Vec<String>,
     /// Mark names (`@pytest.mark.slow` -> "slow"), for `-m` filtering.
     pub marks: Vec<String>,
+    /// Bare-name decorators we could not classify — possibly imported mark
+    /// aliases (`slow = pytest.mark.slow`); resolved at emit time.
+    pub unresolved: Vec<String>,
 }
 
 /// Analyze a decorator list. Multiple stacked `parametrize` decorators
@@ -72,6 +75,7 @@ pub fn from_decorators(decorators: &[ast::Decorator], aliases: &ParamAliases) ->
     let mut sets: Vec<Vec<String>> = Vec::new();
     let mut extra_fixture_requests = Vec::new();
     let mut marks = Vec::new();
+    let mut unresolved = Vec::new();
     let mut poisoned = false;
     let mut parametrized = false;
     for decorator in decorators {
@@ -105,6 +109,13 @@ pub fn from_decorators(decorators: &[ast::Decorator], aliases: &ParamAliases) ->
                 if !is_id_neutral(expr) {
                     poisoned = true;
                 }
+                let target = match expr {
+                    Expr::Call(call) => &*call.func,
+                    other => other,
+                };
+                if let Expr::Name(name) = target {
+                    unresolved.push(name.id.to_string());
+                }
             }
         }
     }
@@ -137,6 +148,7 @@ pub fn from_decorators(decorators: &[ast::Decorator], aliases: &ParamAliases) ->
         expansion,
         extra_fixture_requests,
         marks,
+        unresolved,
     }
 }
 
@@ -311,7 +323,20 @@ fn parametrize_pieces(call: &ast::ExprCall) -> Option<Vec<String>> {
         return None;
     }
 
-    if let Some(ids) = explicit_ids(call) {
+    // `ids=` overrides piece rendering entirely; if present but not fully
+    // resolvable/safe, the whole decorator must fall back.
+    if let Some(ids_value) = ids_kwarg(call) {
+        let Some(elts) = elements(ids_value) else {
+            return None;
+        };
+        let ids: Option<Vec<String>> = elts
+            .iter()
+            .map(|e| match e {
+                Expr::StringLiteral(s) => safe_string(s.value.to_str()),
+                _ => None,
+            })
+            .collect();
+        let ids = ids?;
         let mut seen = std::collections::HashSet::new();
         let unique = ids.iter().all(|p| seen.insert(p.clone()));
         return (unique && ids.len() == values.len()).then_some(ids);
@@ -395,19 +420,12 @@ fn elements(expr: &Expr) -> Option<&[Expr]> {
     }
 }
 
-fn explicit_ids(call: &ast::ExprCall) -> Option<Vec<String>> {
-    let ids = call
-        .arguments
+fn ids_kwarg(call: &ast::ExprCall) -> Option<&Expr> {
+    call.arguments
         .keywords
         .iter()
-        .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "ids"))?;
-    let elts = elements(&ids.value)?;
-    elts.iter()
-        .map(|e| match e {
-            Expr::StringLiteral(s) => safe_string(s.value.to_str()),
-            _ => None,
-        })
-        .collect()
+        .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "ids"))
+        .map(|k| &k.value)
 }
 
 /// Render one literal the way pytest's idmaker does, or None when unsure.
@@ -438,6 +456,6 @@ fn render_scalar(expr: &Expr) -> Option<String> {
 fn safe_string(s: &str) -> Option<String> {
     (!s.is_empty()
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+')))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '=')))
     .then(|| s.to_string())
 }

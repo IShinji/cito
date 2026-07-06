@@ -48,6 +48,10 @@ struct TestDef {
     args: Vec<String>,
     claimed: Vec<String>,
     marks: Vec<String>,
+    maybe_marks: Vec<String>,
+    /// The function body contains a `pytest.skip(...)` call — calling it at
+    /// module level skips the whole module.
+    skips_module: bool,
 }
 
 #[derive(Debug)]
@@ -97,8 +101,15 @@ struct Module {
     order: Vec<TopItem>,
     /// Module names demanded via module-level `pytest.importorskip(...)`.
     skip_requires: Vec<String>,
+    /// A module-level `pytest.skip(...)` call (possibly behind an `if`):
+    /// under a default invocation the module opts out of collection.
+    has_module_skip: bool,
+    /// Bare helper calls at module level — possibly imported skip wrappers.
+    helper_calls: Vec<String>,
     /// Module-level `pytestmark = ...` mark names.
     pytestmark: Vec<String>,
+    /// `slow = pytest.mark.slow` style aliases defined in this module.
+    mark_aliases: HashMap<String, String>,
     /// conftest.py `collect_ignore` / `collect_ignore_glob` (literal lists).
     collect_ignore: Vec<String>,
     collect_ignore_glob: Vec<String>,
@@ -180,7 +191,34 @@ fn test_def(func: &ast::StmtFunctionDef, aliases: &params::ParamAliases) -> Test
         args,
         claimed: params::decorator_argnames(&func.decorator_list),
         marks: info.marks,
+        maybe_marks: info.unresolved,
+        skips_module: body_calls_skip(&func.body),
     }
+}
+
+/// Does this statement list (recursively) contain a `pytest.skip(...)` call?
+fn body_calls_skip(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Expr(expr) => is_module_skip_call(&expr.value),
+        Stmt::If(if_stmt) => {
+            body_calls_skip(&if_stmt.body)
+                || if_stmt
+                    .elif_else_clauses
+                    .iter()
+                    .any(|c| body_calls_skip(&c.body))
+        }
+        Stmt::Try(try_stmt) => {
+            body_calls_skip(&try_stmt.body)
+                || try_stmt.handlers.iter().any(|h| {
+                    let ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_calls_skip(&h.body)
+                })
+                || body_calls_skip(&try_stmt.orelse)
+                || body_calls_skip(&try_stmt.finalbody)
+        }
+        Stmt::With(with_stmt) => body_calls_skip(&with_stmt.body),
+        _ => false,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +245,9 @@ fn discover(roots: &[PathBuf], config: &Config) -> Vec<PathBuf> {
         let walker = WalkBuilder::new(&abs)
             .standard_filters(false)
             .hidden(false)
+            // pytest follows symlinked directories during collection
+            // (pydantic vendors pydantic-core's tests as a symlink).
+            .follow_links(true)
             .filter_entry({
                 let config = config.clone();
                 move |entry| {
@@ -284,7 +325,10 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
         fixtures: HashMap::new(),
         order: Vec::new(),
         skip_requires: Vec::new(),
+        has_module_skip: false,
+        helper_calls: Vec::new(),
         pytestmark: Vec::new(),
+        mark_aliases: HashMap::new(),
         collect_ignore: Vec::new(),
         collect_ignore_glob: Vec::new(),
         has_generate_tests: false,
@@ -347,6 +391,10 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                             other => module.pytestmark.extend(params::mark_name(other)),
                         }
                     }
+                    // `slow = pytest.mark.slow` mark aliases.
+                    if let Some(mark) = params::mark_name(&assign.value) {
+                        module.mark_aliases.insert(target.id.to_string(), mark);
+                    }
                     // conftest collect_ignore lists (literal entries only).
                     if matches!(target.id.as_str(), "collect_ignore" | "collect_ignore_glob") {
                         let entries = string_list(&assign.value);
@@ -366,6 +414,16 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                 // Bare `pytest.importorskip("numba")` at module level.
                 if let Some(name) = importorskip_name(&expr_stmt.value) {
                     module.skip_requires.push(name);
+                }
+                if is_module_skip_call(&expr_stmt.value) {
+                    module.has_module_skip = true;
+                } else if let Expr::Call(call) = &*expr_stmt.value {
+                    let name = match &*call.func {
+                        Expr::Name(name) => Some(name.id.to_string()),
+                        Expr::Attribute(attr) => Some(attr.attr.to_string()),
+                        _ => None,
+                    };
+                    module.helper_calls.extend(name);
                 }
             }
             Stmt::Import(import) => {
@@ -422,6 +480,25 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                         .imports
                         .insert(local, Import::From(mref.clone(), alias.name.to_string()));
                 }
+            }
+            // Definitions inside top-level if/else and try/except are real
+            // module members for whichever branch runs; collecting from all
+            // branches over-approximates, and the keep-last name dedupe
+            // resolves the common "same name in both branches" pattern.
+            Stmt::If(if_stmt) if top => {
+                scan(&if_stmt.body, module, aliases, true);
+                for clause in &if_stmt.elif_else_clauses {
+                    scan(&clause.body, module, aliases, true);
+                }
+            }
+            Stmt::Try(try_stmt) if top => {
+                scan(&try_stmt.body, module, aliases, true);
+                for handler in &try_stmt.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    scan(&h.body, module, aliases, true);
+                }
+                scan(&try_stmt.orelse, module, aliases, true);
+                scan(&try_stmt.finalbody, module, aliases, true);
             }
             Stmt::If(if_stmt) => {
                 scan(&if_stmt.body, module, aliases, false);
@@ -519,6 +596,18 @@ fn string_list(expr: &Expr) -> Vec<String> {
         .collect()
 }
 
+/// `pytest.skip(...)` at module level (any arguments).
+fn is_module_skip_call(expr: &Expr) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    match &*call.func {
+        Expr::Attribute(attr) => attr.attr.as_str() == "skip",
+        Expr::Name(name) => name.id.as_str() == "skip",
+        _ => false,
+    }
+}
+
 /// `pytest.importorskip("name")` (or bare `importorskip("name")`).
 fn importorskip_name(expr: &Expr) -> Option<String> {
     let Expr::Call(call) = expr else {
@@ -566,6 +655,9 @@ struct Resolver<'a> {
     /// statically (keep environment-conditional modules).
     probe_python: Option<String>,
     probe_cache: HashMap<String, bool>,
+    /// The probe python's sys.path entries — lets absolute imports resolve
+    /// into site-packages (e.g. external TestCase base classes). Lazy.
+    sys_paths: Option<Vec<PathBuf>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -575,7 +667,28 @@ impl<'a> Resolver<'a> {
             cache: HashMap::new(),
             probe_python,
             probe_cache: HashMap::new(),
+            sys_paths: None,
         }
+    }
+
+    fn sys_paths(&mut self) -> Vec<PathBuf> {
+        if let Some(paths) = &self.sys_paths {
+            return paths.clone();
+        }
+        let mut paths = Vec::new();
+        if let Some(python) = &self.probe_python {
+            if let Ok(out) = std::process::Command::new(python)
+                .arg("-c")
+                .arg("import json, sys; print(json.dumps([p for p in sys.path if p]))")
+                .output()
+            {
+                if let Ok(list) = serde_json::from_slice::<Vec<String>>(&out.stdout) {
+                    paths = list.into_iter().map(PathBuf::from).collect();
+                }
+            }
+        }
+        self.sys_paths = Some(paths.clone());
+        paths
     }
 
     /// Is `name` importable in the probe interpreter? Only called when a
@@ -682,6 +795,7 @@ print(json.dumps(result))
                 if let Some(pkg_root) = package_root_above(importer_dir) {
                     roots.push(pkg_root);
                 }
+                roots.extend(self.sys_paths());
                 roots
                     .iter()
                     .flat_map(|root| {
@@ -756,6 +870,27 @@ print(json.dumps(result))
                     if is_unittest_ref(&mref, &orig) {
                         return None;
                     }
+                    let next = self.resolve_ref(&mref, &module.dir.clone())?;
+                    module = next;
+                    name = orig;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Resolve a bare decorator name to a mark name, chasing imports
+    /// (`from sympy.testing.pytest import slow` -> `slow = pytest.mark.slow`).
+    fn resolve_mark_alias(&mut self, module: &Rc<Module>, name: &str) -> Option<String> {
+        let mut module = module.clone();
+        let mut name = name.to_string();
+        for _ in 0..8 {
+            if let Some(mark) = module.mark_aliases.get(&name) {
+                return Some(mark.clone());
+            }
+            match module.imports.get(&name).cloned() {
+                Some(Import::From(mref, orig)) => {
                     let next = self.resolve_ref(&mref, &module.dir.clone())?;
                     module = next;
                     name = orig;
@@ -880,6 +1015,11 @@ print(json.dumps(result))
             match self.resolve_base(module, base) {
                 BaseTarget::Unittest => unittest = true,
                 BaseTarget::Local(target_mod, target_name) => {
+                    // Chasing landed inside the stdlib unittest package.
+                    if is_unittest_module_class(&target_mod, &target_name) {
+                        unittest = true;
+                        continue;
+                    }
                     let key = (target_mod.path.clone(), target_name.clone());
                     if visited.contains(&key) {
                         continue;
@@ -922,12 +1062,26 @@ fn package_root_above(dir: &Path) -> Option<PathBuf> {
     topmost.and_then(|t| t.parent()).map(Path::to_path_buf)
 }
 
+const UNITTEST_CLASSES: &[&str] = &["TestCase", "IsolatedAsyncioTestCase", "FunctionTestCase"];
+
 fn is_unittest_ref(mref: &ModuleRef, name: &str) -> bool {
     matches!(
         mref,
         ModuleRef::Absolute(dotted)
-            if (dotted == "unittest" || dotted == "unittest.case") && name == "TestCase"
+            if matches!(
+                dotted.as_str(),
+                "unittest" | "unittest.case" | "unittest.async_case"
+            ) && UNITTEST_CLASSES.contains(&name)
     )
+}
+
+/// A base that resolved into the stdlib `unittest` package itself.
+fn is_unittest_module_class(module: &Module, name: &str) -> bool {
+    UNITTEST_CLASSES.contains(&name)
+        && module
+            .path
+            .components()
+            .any(|c| c.as_os_str() == "unittest")
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1182,31 @@ fn emit_module(
     // conftest chain drops the whole module when the dependency is absent,
     // matching pytest's behavior in that environment.
     if resolver.probe_python.is_some() {
+        if contexts.iter().any(|m| m.has_module_skip) {
+            return Vec::new();
+        }
+        for helper in &module.helper_calls {
+            if module
+                .functions
+                .get(helper)
+                .map(|def| def.skips_module)
+                .unwrap_or(false)
+            {
+                return Vec::new();
+            }
+            if let Some((target, name)) =
+                resolver.resolve_symbol_or_function(module.clone(), helper.clone())
+            {
+                if target
+                    .functions
+                    .get(&name)
+                    .map(|def| def.skips_module)
+                    .unwrap_or(false)
+                {
+                    return Vec::new();
+                }
+            }
+        }
         let requires: Vec<String> = contexts
             .iter()
             .flat_map(|m| m.skip_requires.iter().cloned())
@@ -1049,12 +1228,17 @@ fn emit_module(
         match item {
             TopItem::Func(def) => {
                 if resolver.config.function_matches(&def.name) {
-                    let names: HashSet<String> = module
+                    let mut names: HashSet<String> = module
                         .pytestmark
                         .iter()
                         .chain(def.marks.iter())
                         .cloned()
                         .collect();
+                    for candidate in &def.maybe_marks {
+                        if let Some(mark) = resolver.resolve_mark_alias(module, candidate) {
+                            names.insert(mark);
+                        }
+                    }
                     if let Some(expr) = marker {
                         if !expr.matches_names(&names) {
                             continue;
@@ -1144,12 +1328,17 @@ fn emit_module(
         }
         if resolver.config.function_matches(&local) {
             if let Some(def) = target.functions.get(&orig) {
-                let names: HashSet<String> = module
+                let mut names: HashSet<String> = module
                     .pytestmark
                     .iter()
                     .chain(def.marks.iter())
                     .cloned()
                     .collect();
+                for candidate in &def.maybe_marks {
+                    if let Some(mark) = resolver.resolve_mark_alias(&target, candidate) {
+                        names.insert(mark);
+                    }
+                }
                 if let Some(expr) = marker {
                     if !expr.matches_names(&names) {
                         continue;
@@ -1217,12 +1406,17 @@ fn emit_class(
         if !matches {
             continue;
         }
-        let names: HashSet<String> = pytestmark
+        let mut names: HashSet<String> = pytestmark
             .iter()
             .chain(chain_marks.iter())
             .chain(def.marks.iter())
             .cloned()
             .collect();
+        for candidate in &def.maybe_marks {
+            if let Some(mark) = resolver.resolve_mark_alias(module, candidate) {
+                names.insert(mark);
+            }
+        }
         if let Some(expr) = marker {
             if !expr.matches_names(&names) {
                 continue;

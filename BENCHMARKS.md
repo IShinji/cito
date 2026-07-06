@@ -41,9 +41,14 @@ is a documented gap), 0 extras. This suite exercises pytest's own config
 ### Validation matrix (release gate)
 
 `scripts/validate_repos.py` diff-checks a matrix of real repositories at the
-tags matching the installed wheels. As of v0.2: click (1,686 IDs), jinja2
-(909), attrs (1,386), httpx (1,418), starlette (981), urllib3 (2,273) — all
-exact, zero missing, zero extras.
+tags matching the installed wheels. As of v0.2, fifteen repos are exact
+(zero missing, zero extras): click 1,686 IDs, jinja2 909, attrs 1,386,
+httpx 1,418, starlette 981, urllib3 2,273, werkzeug 969, requests 633,
+more-itertools 722, packaging 61,513, pluggy 124, tornado 1,322, black 446,
+pydantic 12,775, fastapi 3,317. sympy (13,657) is documented-partial: 0
+missing, 39 extras (0.3%) from its custom @SKIP import-time machinery and
+environment-conditional test definitions. sqlalchemy and django are out of
+scope (their suites need project-specific collection-bootstrap plugins).
 
 ### flask 3.1.3 and rich 15.0.0
 

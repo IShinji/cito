@@ -4,6 +4,18 @@
 
 Initial release.
 
+- Second validation wave (werkzeug, requests, more-itertools, packaging,
+  pluggy, tornado, black, pydantic, fastapi, sympy — 15/16 exact): symlinked
+  test directories are followed like pytest does (pydantic vendors
+  pydantic-core's tests via a symlink); absolute imports also resolve
+  through the probe python's sys.path, so external TestCase bases work
+  (aiohttp's AioHTTPTestCase, IsolatedAsyncioTestCase, stdlib chase);
+  top-level if/else and try/except test definitions are collected from all
+  branches with keep-last shadowing; mark aliases (`slow =
+  pytest.mark.slow`) resolve through imports for `-m`; module-level
+  conditional `pytest.skip(...)` and imported skip-helper functions drop
+  modules under probing; unresolvable `ids=` now falls back instead of
+  being ignored, and `=` is allowed in rendered IDs.
 - Validation-matrix findings, all fixed and locked in by
   `scripts/validate_repos.py` (click, jinja2, attrs, httpx, starlette,
   urllib3 — all exact): quote-aware `addopts` splitting with `-m`/`-k`

@@ -41,6 +41,16 @@ And the part that matters more than speed — **the same answers**:
 | httpx 0.28.1 | 1,418 | 0 | 0 |
 | starlette 1.3.1 | 981 | 0 | 0 |
 | urllib3 2.7.0 | 2,273 | 0 | 0 |
+| werkzeug 3.1.8 | 969 | 0 | 0 |
+| requests 2.34.2 | 633 | 0 | 0 |
+| more-itertools 11.1.0 | 722 | 0 | 0 |
+| packaging 26.2 | 61,513 | 0 | 0 |
+| pluggy 1.6.0 | 124 | 0 | 0 |
+| tornado 6.5.7 | 1,322 | 0 | 0 |
+| black 26.5.1 | 446 | 0 | 0 |
+| pydantic 2.13.4 | 12,775 | 0 | 0 |
+| fastapi 0.139.0 | 3,317 | 0 | 0 |
+| sympy 1.14.0 | 13,657 | 0 | 39 (0.3%: custom @SKIP machinery + env-conditional defs) |
 
 (`scripts/validate_repos.py` reruns the whole matrix against fresh clones —
 the release gate. sqlalchemy and django are documented out: their suites
