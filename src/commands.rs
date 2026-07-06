@@ -105,37 +105,27 @@ fn resolve_roots(paths: Vec<PathBuf>, config: &Config, cwd: &Path) -> Vec<PathBu
     vec![cwd.to_path_buf()]
 }
 
-/// pytest anchors config/rootdir discovery at the common ancestor of the
-/// given paths, falling back to the invocation directory.
-fn discovery_anchor(paths: &[PathBuf], cwd: &Path) -> PathBuf {
-    let mut ancestor: Option<PathBuf> = None;
-    for path in paths {
-        let abs = if path.is_absolute() {
-            path.clone()
-        } else {
-            cwd.join(path)
-        };
-        let abs = abs.canonicalize().unwrap_or(abs);
-        let dir = if abs.is_file() {
-            abs.parent().unwrap_or(&abs).to_path_buf()
-        } else {
-            abs
-        };
-        ancestor = Some(match ancestor {
-            None => dir,
-            Some(current) => {
-                let mut shared = PathBuf::new();
-                for (a, b) in current.components().zip(dir.components()) {
-                    if a != b {
-                        break;
-                    }
-                    shared.push(a);
-                }
-                shared
+/// pytest's `get_dirs_from_args`: absolutized argument paths that exist,
+/// files replaced by their parent directory.
+fn dirs_from_args(paths: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let abs = if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(path)
+            };
+            if !abs.exists() {
+                return None;
             }
-        });
-    }
-    ancestor.unwrap_or_else(|| cwd.to_path_buf())
+            if abs.is_file() {
+                abs.parent().map(Path::to_path_buf)
+            } else {
+                Some(abs)
+            }
+        })
+        .collect()
 }
 
 struct Collected {
@@ -154,8 +144,8 @@ fn collect_files(
 ) -> Result<Collected, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (root_args, selectors) = parse_selections(paths, &cwd);
-    let anchor = discovery_anchor(&root_args, &cwd);
-    let config = Config::discover(&anchor);
+    let arg_dirs = dirs_from_args(&root_args, &cwd);
+    let config = Config::discover_for(&cwd, &arg_dirs);
     let marker = marker_cli
         .or_else(|| config.addopts_flag("-m"))
         .map(|m| keyword::parse(&m).map_err(|e| format!("invalid -m expression: {e}")))

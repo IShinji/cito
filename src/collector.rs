@@ -52,6 +52,9 @@ struct TestDef {
     /// The function body contains a `pytest.skip(...)` call — calling it at
     /// module level skips the whole module.
     skips_module: bool,
+    /// Body is exactly `return <expr>` with a constant-evaluable expr —
+    /// usable as a platform predicate (`if is_win32():`).
+    returns_const: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -75,6 +78,15 @@ struct Class {
 enum TopItem {
     Func(TestDef),
     Class(String),
+}
+
+/// A branch guard resolvable only with cross-file or environment knowledge.
+#[derive(Debug, Clone)]
+enum DeferredGuard {
+    /// `if predicate():` where predicate is a (possibly imported) function.
+    Call { name: String, negated: bool },
+    /// `if binding:` where `binding = import_module("mod")`.
+    Binding { module: String, negated: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +118,15 @@ struct Module {
     has_module_skip: bool,
     /// Bare helper calls at module level — possibly imported skip wrappers.
     helper_calls: Vec<String>,
+    /// `NAME = import_module('mod')` / importorskip bindings.
+    import_bindings: HashMap<String, String>,
+    /// `X = Machine.TestCase` synthetic unittest classes.
+    synthetic_testcases: Vec<String>,
+    /// Top-level defs guarded by a condition we can only resolve at emit
+    /// time (imported predicates, import-availability bindings).
+    cond_blocks: Vec<(DeferredGuard, Vec<String>)>,
+    /// Names defined on unconditional top-level paths (never deadened).
+    certain_names: HashSet<String>,
     /// Module-level `pytestmark = ...` mark names.
     pytestmark: Vec<String>,
     /// `slow = pytest.mark.slow` style aliases defined in this module.
@@ -195,6 +216,15 @@ fn test_def(func: &ast::StmtFunctionDef, aliases: &params::ParamAliases) -> Test
         marks: info.marks,
         maybe_marks: info.unresolved,
         skips_module: body_calls_skip(&func.body),
+        returns_const: const_return(&func.body),
+    }
+}
+
+/// `def f(): return <evaluable>` — the constant truth of the return value.
+fn const_return(body: &[Stmt]) -> Option<bool> {
+    match body {
+        [Stmt::Return(ret)] => ret.value.as_deref().and_then(eval_condition),
+        _ => None,
     }
 }
 
@@ -329,6 +359,10 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
         skip_requires: Vec::new(),
         has_module_skip: false,
         helper_calls: Vec::new(),
+        import_bindings: HashMap::new(),
+        synthetic_testcases: Vec::new(),
+        cond_blocks: Vec::new(),
+        certain_names: HashSet::new(),
         pytestmark: Vec::new(),
         mark_aliases: HashMap::new(),
         plugin_modules: Vec::new(),
@@ -337,7 +371,7 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
         has_generate_tests: false,
     };
     let mut aliases = params::ParamAliases::new();
-    scan(&syntax.body, &mut module, &mut aliases, true);
+    scan(&syntax.body, &mut module, &mut aliases, true, true);
     module.order = dedupe_keep_last(std::mem::take(&mut module.order), |item| match item {
         TopItem::Func(def) => def.name.as_str(),
         TopItem::Class(name) => name.as_str(),
@@ -348,10 +382,19 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
 /// Walk statements. Definitions only count at true top level; imports are
 /// also harvested from inside `if`/`try`/`with` blocks (the common
 /// conditional-import patterns), since over-approximating imports is safe.
-fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases, top: bool) {
+fn scan(
+    stmts: &[Stmt],
+    module: &mut Module,
+    aliases: &mut params::ParamAliases,
+    top: bool,
+    certain: bool,
+) {
     for stmt in stmts {
         match stmt {
             Stmt::FunctionDef(func) if top => {
+                if certain {
+                    module.certain_names.insert(func.name.to_string());
+                }
                 if func.name.as_str() == "pytest_generate_tests" {
                     module.has_generate_tests = true;
                     continue;
@@ -374,6 +417,9 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                 module.order.push(TopItem::Func(def));
             }
             Stmt::ClassDef(class) if top => {
+                if certain {
+                    module.certain_names.insert(class.name.to_string());
+                }
                 let name = class.name.to_string();
                 module
                     .classes
@@ -411,6 +457,18 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                     // `slow = pytest.mark.slow` mark aliases.
                     if let Some(mark) = params::mark_name(&assign.value) {
                         module.mark_aliases.insert(target.id.to_string(), mark);
+                    }
+                    // `cin = import_module('clang.cindex')` availability
+                    // binding (sympy idiom) — resolved via the probe.
+                    if let Some(name) = import_module_binding(&assign.value) {
+                        module.import_bindings.insert(target.id.to_string(), name);
+                    }
+                    // `TestFoo = SomeStateMachine.TestCase` (hypothesis
+                    // stateful idiom): a synthetic unittest class.
+                    if let Expr::Attribute(attr) = &*assign.value {
+                        if attr.attr.as_str() == "TestCase" {
+                            module.synthetic_testcases.push(target.id.to_string());
+                        }
                     }
                     // conftest collect_ignore lists (literal entries only).
                     if matches!(target.id.as_str(), "collect_ignore" | "collect_ignore_glob") {
@@ -508,19 +566,59 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
             // resolves the common "same name in both branches" pattern.
             Stmt::If(if_stmt) if top => {
                 let cond = eval_condition(&if_stmt.test);
-                scan(&if_stmt.body, module, aliases, cond != Some(false));
+                if cond.is_none() {
+                    if let Some(guard) = classify_guard(&if_stmt.test, &module.import_bindings) {
+                        let names = defined_names(&if_stmt.body);
+                        if !names.is_empty() {
+                            module.cond_blocks.push((guard.clone(), names));
+                        }
+                        // Plain else-branch names carry the inverted guard.
+                        for clause in &if_stmt.elif_else_clauses {
+                            if clause.test.is_none() {
+                                let names = defined_names(&clause.body);
+                                if !names.is_empty() {
+                                    let inverted = match guard.clone() {
+                                        DeferredGuard::Call { name, negated } => {
+                                            DeferredGuard::Call {
+                                                name,
+                                                negated: !negated,
+                                            }
+                                        }
+                                        DeferredGuard::Binding { module, negated } => {
+                                            DeferredGuard::Binding {
+                                                module,
+                                                negated: !negated,
+                                            }
+                                        }
+                                    };
+                                    module.cond_blocks.push((inverted, names));
+                                }
+                            }
+                        }
+                    }
+                }
+                scan(
+                    &if_stmt.body,
+                    module,
+                    aliases,
+                    cond != Some(false),
+                    certain && cond == Some(true),
+                );
                 // else/elif run when the if-condition is false or unknown;
                 // elif conditions are rarely used in these guards, so treat
                 // them like the else arm.
                 let else_live = cond != Some(true);
                 for clause in &if_stmt.elif_else_clauses {
-                    let live = else_live
+                    let clause_cond = clause.test.as_ref().and_then(eval_condition);
+                    let live = else_live && clause_cond != Some(false);
+                    let clause_certain = certain
+                        && cond == Some(false)
                         && clause
                             .test
                             .as_ref()
-                            .map(|t| eval_condition(t) != Some(false))
+                            .map(|t| eval_condition(t) == Some(true))
                             .unwrap_or(true);
-                    scan(&clause.body, module, aliases, live);
+                    scan(&clause.body, module, aliases, live, clause_certain);
                 }
             }
             Stmt::Try(try_stmt) if top => {
@@ -547,30 +645,30 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                         }
                     }
                 }
-                scan(&try_stmt.body, module, aliases, true);
+                scan(&try_stmt.body, module, aliases, true, certain);
                 for handler in &try_stmt.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
-                    scan(&h.body, module, aliases, false);
+                    scan(&h.body, module, aliases, false, false);
                 }
-                scan(&try_stmt.orelse, module, aliases, true);
-                scan(&try_stmt.finalbody, module, aliases, true);
+                scan(&try_stmt.orelse, module, aliases, true, false);
+                scan(&try_stmt.finalbody, module, aliases, true, certain);
             }
             Stmt::If(if_stmt) => {
-                scan(&if_stmt.body, module, aliases, false);
+                scan(&if_stmt.body, module, aliases, false, false);
                 for clause in &if_stmt.elif_else_clauses {
-                    scan(&clause.body, module, aliases, false);
+                    scan(&clause.body, module, aliases, false, false);
                 }
             }
             Stmt::Try(try_stmt) => {
-                scan(&try_stmt.body, module, aliases, false);
+                scan(&try_stmt.body, module, aliases, false, false);
                 for handler in &try_stmt.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
-                    scan(&h.body, module, aliases, false);
+                    scan(&h.body, module, aliases, false, false);
                 }
-                scan(&try_stmt.orelse, module, aliases, false);
-                scan(&try_stmt.finalbody, module, aliases, false);
+                scan(&try_stmt.orelse, module, aliases, false, false);
+                scan(&try_stmt.finalbody, module, aliases, false, false);
             }
-            Stmt::With(with_stmt) => scan(&with_stmt.body, module, aliases, false),
+            Stmt::With(with_stmt) => scan(&with_stmt.body, module, aliases, false, certain),
             _ => {}
         }
     }
@@ -745,6 +843,91 @@ fn dotted(expr: &Expr) -> Option<String> {
         Expr::Attribute(attr) => Some(format!("{}.{}", dotted(&attr.value)?, attr.attr)),
         _ => None,
     }
+}
+
+/// `import_module('name')` / `importorskip('name')` call → the name.
+fn import_module_binding(expr: &Expr) -> Option<String> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    let callee = match &*call.func {
+        Expr::Attribute(attr) => attr.attr.as_str(),
+        Expr::Name(name) => name.id.as_str(),
+        _ => return None,
+    };
+    if !matches!(callee, "import_module" | "importorskip") {
+        return None;
+    }
+    match call.arguments.args.first() {
+        Some(Expr::StringLiteral(s)) => Some(s.value.to_str().to_string()),
+        _ => None,
+    }
+}
+
+/// Classify an if-guard we could not constant-fold into a deferred form.
+fn classify_guard(expr: &Expr, bindings: &HashMap<String, String>) -> Option<DeferredGuard> {
+    match expr {
+        Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOp::Not) => {
+            classify_guard(&u.operand, bindings).map(|g| match g {
+                DeferredGuard::Call { name, negated } => DeferredGuard::Call {
+                    name,
+                    negated: !negated,
+                },
+                DeferredGuard::Binding { module, negated } => DeferredGuard::Binding {
+                    module,
+                    negated: !negated,
+                },
+            })
+        }
+        Expr::Call(call) if call.arguments.args.is_empty() => match &*call.func {
+            Expr::Name(name) => Some(DeferredGuard::Call {
+                name: name.id.to_string(),
+                negated: false,
+            }),
+            _ => None,
+        },
+        Expr::Name(name) => bindings
+            .get(name.id.as_str())
+            .map(|m| DeferredGuard::Binding {
+                module: m.clone(),
+                negated: false,
+            }),
+        // `X is None` / `X is not None`
+        Expr::Compare(cmp) if cmp.ops.len() == 1 && cmp.comparators.len() == 1 => {
+            let Expr::Name(name) = &*cmp.left else {
+                return None;
+            };
+            if !matches!(cmp.comparators[0], Expr::NoneLiteral(_)) {
+                return None;
+            }
+            let module = bindings.get(name.id.as_str())?.clone();
+            match cmp.ops[0] {
+                ast::CmpOp::Is => Some(DeferredGuard::Binding {
+                    module,
+                    negated: true,
+                }),
+                ast::CmpOp::IsNot => Some(DeferredGuard::Binding {
+                    module,
+                    negated: false,
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Names of top-level test-relevant definitions in a statement list
+/// (shallow: exactly the names the branch would bind).
+fn defined_names(stmts: &[Stmt]) -> Vec<String> {
+    stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::FunctionDef(f) => Some(f.name.to_string()),
+            Stmt::ClassDef(c) => Some(c.name.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `pytest.skip(...)` at module level (any arguments).
@@ -1384,6 +1567,42 @@ fn emit_module(
         }
     }
 
+    // Resolve deferred branch guards (imported predicates, import-module
+    // availability bindings) into a set of dead definition names.
+    let mut dead: HashSet<String> = HashSet::new();
+    let mut alive: HashSet<String> = HashSet::new();
+    for (guard, names) in &module.cond_blocks {
+        let truth = match guard {
+            DeferredGuard::Call { name, negated } => resolver
+                .resolve_symbol_or_function(module.clone(), name.clone())
+                .and_then(|(target, resolved)| {
+                    target
+                        .functions
+                        .get(&resolved)
+                        .and_then(|d| d.returns_const)
+                })
+                .map(|v| v != *negated),
+            DeferredGuard::Binding {
+                module: dep,
+                negated,
+            } => {
+                if resolver.probe_python.is_some() {
+                    Some(resolver.probe_ok(dep) != *negated)
+                } else {
+                    None
+                }
+            }
+        };
+        match truth {
+            Some(false) => dead.extend(names.iter().cloned()),
+            Some(true) => alive.extend(names.iter().cloned()),
+            None => alive.extend(names.iter().cloned()),
+        }
+    }
+    for name in alive.iter().chain(module.certain_names.iter()) {
+        dead.remove(name);
+    }
+
     // A pytest_generate_tests hook or a parametrized autouse fixture
     // anywhere in scope can add parameters we cannot see; exact expansions
     // are no longer trustworthy.
@@ -1393,6 +1612,13 @@ fn emit_module(
 
     let mut tests = Vec::new();
     for item in &module.order {
+        let item_name = match item {
+            TopItem::Func(def) => def.name.as_str(),
+            TopItem::Class(name) => name.as_str(),
+        };
+        if dead.contains(item_name) {
+            continue;
+        }
         match item {
             TopItem::Func(def) => {
                 if resolver.config.function_matches(&def.name) {
@@ -1447,6 +1673,21 @@ fn emit_module(
                 );
             }
         }
+    }
+
+    // `X = SomeStateMachine.TestCase` bindings (hypothesis stateful): a
+    // unittest TestCase whose single test method is runTest.
+    for name in &module.synthetic_testcases {
+        if dead.contains(name) || module.classes.contains_key(name) {
+            continue;
+        }
+        if let Some(expr) = marker {
+            let names: HashSet<String> = module.pytestmark.iter().cloned().collect();
+            if !expr.matches_names(&names) {
+                continue;
+            }
+        }
+        tests.push(format!("{name}::runTest"));
     }
 
     // pytest collects over the module NAMESPACE: test classes/functions

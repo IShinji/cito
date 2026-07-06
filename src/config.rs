@@ -127,20 +127,49 @@ fn shell_split(input: &str) -> Vec<String> {
 }
 
 impl Config {
+    /// Convenience wrapper: discover with the invocation dir as the only arg.
     pub fn discover(start: &Path) -> Config {
-        let start = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
-        for dir in start.ancestors() {
-            if let Some((source, options)) = config_in(dir) {
-                return Config::build(dir.to_path_buf(), Some(source), options);
-            }
+        Config::discover_for(start, &[])
+    }
+
+    /// Mirror of pytest's `determine_setup` (src/_pytest/config/findpaths.py):
+    /// 1. compute the common ancestor of the argument directories;
+    /// 2. walk it upward for a config file (pytest.toml, .pytest.toml,
+    ///    pytest.ini, .pytest.ini, pyproject.toml with a [tool.pytest*]
+    ///    table, tox.ini with [pytest], setup.cfg with [tool:pytest]);
+    ///    a section-less pyproject.toml is only remembered as a last resort;
+    /// 3. else walk upward for setup.py;
+    /// 4. else repeat the config search from each argument dir separately;
+    /// 5. else rootdir = common ancestor of the invocation dir and the args.
+    pub fn discover_for(invocation_dir: &Path, arg_dirs: &[PathBuf]) -> Config {
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let invocation_dir = canon(invocation_dir);
+        let dirs: Vec<PathBuf> = arg_dirs
+            .iter()
+            .map(|p| canon(p))
+            .filter(|p| p.exists())
+            .collect();
+        let ancestor = common_ancestor(&invocation_dir, &dirs);
+
+        if let Some((root, source, options)) = locate_config(std::slice::from_ref(&ancestor)) {
+            return Config::build(root, Some(source), options);
         }
-        // No configfile anywhere: pytest falls back to a setup.py anchor.
-        for dir in start.ancestors() {
+        for dir in ancestor.ancestors() {
             if dir.join("setup.py").is_file() {
                 return Config::build(dir.to_path_buf(), None, HashMap::new());
             }
         }
-        Config::build(start, None, HashMap::new())
+        if dirs.as_slice() != std::slice::from_ref(&ancestor) && !dirs.is_empty() {
+            if let Some((root, source, options)) = locate_config(&dirs) {
+                return Config::build(root, Some(source), options);
+            }
+        }
+        let mut root =
+            common_ancestor(&invocation_dir, &[invocation_dir.clone(), ancestor.clone()]);
+        if root.parent().is_none() {
+            root = ancestor;
+        }
+        Config::build(root, None, HashMap::new())
     }
 
     fn build(
@@ -218,52 +247,104 @@ impl Config {
     }
 }
 
-/// Return `(config file, options)` if `dir` holds a pytest config, honoring
-/// pytest's precedence. `pytest.ini` counts even when empty; the other three
-/// only count when they contain their pytest section.
-fn config_in(dir: &Path) -> Option<(PathBuf, HashMap<String, Vec<String>>)> {
-    let pytest_ini = dir.join("pytest.ini");
-    if pytest_ini.is_file() {
-        let text = std::fs::read_to_string(&pytest_ini).unwrap_or_default();
-        let options = ini_section(&text, "pytest").unwrap_or_default();
-        return Some((pytest_ini, options));
+/// pytest's common-ancestor computation (existing paths only; files count
+/// via their own path; empty input falls back to the invocation dir).
+fn common_ancestor(invocation_dir: &Path, paths: &[PathBuf]) -> PathBuf {
+    let mut ancestor: Option<PathBuf> = None;
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        ancestor = Some(match ancestor {
+            None => path.clone(),
+            Some(current) => {
+                if path.starts_with(&current) {
+                    current
+                } else if current.starts_with(path) {
+                    path.clone()
+                } else {
+                    let mut shared = PathBuf::new();
+                    for (a, b) in current.components().zip(path.components()) {
+                        if a != b {
+                            break;
+                        }
+                        shared.push(a);
+                    }
+                    shared
+                }
+            }
+        });
     }
-    let pyproject = dir.join("pyproject.toml");
-    if pyproject.is_file() {
-        // Like pytest.ini, any pyproject.toml counts as a configfile and
-        // rootdir anchor (pytest >= 8 behavior), with options only when a
-        // [tool.pytest] / [tool.pytest.ini_options] table is present.
-        let text = std::fs::read_to_string(&pyproject).unwrap_or_default();
-        let options = pyproject_options(&text).unwrap_or_default();
-        return Some((pyproject, options));
+    let ancestor = ancestor.unwrap_or_else(|| invocation_dir.to_path_buf());
+    if ancestor.is_file() {
+        ancestor.parent().unwrap_or(&ancestor).to_path_buf()
+    } else {
+        ancestor
     }
-    let tox = dir.join("tox.ini");
-    if tox.is_file() {
-        let text = std::fs::read_to_string(&tox).unwrap_or_default();
-        if let Some(options) = ini_section(&text, "pytest") {
-            return Some((tox, options));
+}
+
+const CONFIG_NAMES: &[&str] = &[
+    "pytest.toml",
+    ".pytest.toml",
+    "pytest.ini",
+    ".pytest.ini",
+    "pyproject.toml",
+    "tox.ini",
+    "setup.cfg",
+];
+
+/// pytest's `locate_config`: walk each arg and its parents, trying the
+/// config names in order. A section-less pyproject.toml never wins directly
+/// but the first one seen becomes the fallback rootdir anchor.
+fn locate_config(args: &[PathBuf]) -> Option<(PathBuf, PathBuf, HashMap<String, Vec<String>>)> {
+    let mut bare_pyproject: Option<PathBuf> = None;
+    for arg in args {
+        let chain = std::iter::once(arg.as_path()).chain(arg.ancestors().skip(1));
+        for base in chain {
+            for name in CONFIG_NAMES {
+                let candidate = base.join(name);
+                if !candidate.is_file() {
+                    continue;
+                }
+                if *name == "pyproject.toml" && bare_pyproject.is_none() {
+                    bare_pyproject = Some(candidate.clone());
+                }
+                if let Some(options) = load_config_file(&candidate) {
+                    return Some((base.to_path_buf(), candidate, options));
+                }
+            }
         }
     }
-    let setup_cfg = dir.join("setup.cfg");
-    if setup_cfg.is_file() {
-        let text = std::fs::read_to_string(&setup_cfg).unwrap_or_default();
-        if let Some(options) = ini_section(&text, "tool:pytest") {
-            return Some((setup_cfg, options));
+    bare_pyproject.map(|p| {
+        let parent = p.parent().unwrap_or(Path::new("/")).to_path_buf();
+        (parent, p, HashMap::new())
+    })
+}
+
+/// pytest's `load_config_dict_from_file`: None = this file is not a pytest
+/// config (a bare pyproject.toml, a tox.ini without [pytest], ...).
+fn load_config_file(path: &Path) -> Option<HashMap<String, Vec<String>>> {
+    let name = path.file_name()?.to_str()?;
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    match name {
+        // Always a config source, even when empty.
+        "pytest.ini" | ".pytest.ini" => Some(ini_section(&text, "pytest").unwrap_or_default()),
+        "pytest.toml" | ".pytest.toml" => {
+            let value: toml::Table = text.parse().ok()?;
+            let table = value.get("pytest").and_then(|v| v.as_table());
+            Some(table.map(extract_toml_options).unwrap_or_default())
         }
+        "pyproject.toml" => pyproject_options(&text),
+        "tox.ini" => ini_section(&text, "pytest"),
+        "setup.cfg" => ini_section(&text, "tool:pytest"),
+        _ => None,
     }
-    None
 }
 
 /// pytest 9 accepts both `[tool.pytest]` (canonical) and the legacy
 /// `[tool.pytest.ini_options]`; when both exist, ini_options wins per key
 /// order here (checked first).
-fn pyproject_options(text: &str) -> Option<HashMap<String, Vec<String>>> {
-    let value: toml::Table = text.parse().ok()?;
-    let pytest = value.get("tool")?.as_table()?.get("pytest")?.as_table()?;
-    let table = pytest
-        .get("ini_options")
-        .and_then(|v| v.as_table())
-        .unwrap_or(pytest);
+fn extract_toml_options(table: &toml::Table) -> HashMap<String, Vec<String>> {
     let mut options = HashMap::new();
     for (key, value) in table {
         let values = match value {
@@ -277,11 +358,22 @@ fn pyproject_options(text: &str) -> Option<HashMap<String, Vec<String>>> {
         };
         options.insert(key.clone(), values);
     }
-    // `[tool.pytest]` holding only an ini_options table is not itself a config.
-    if options.is_empty() && pytest.get("ini_options").is_none() {
+    options
+}
+
+fn pyproject_options(text: &str) -> Option<HashMap<String, Vec<String>>> {
+    let value: toml::Table = text.parse().ok()?;
+    let pytest = value.get("tool")?.as_table()?.get("pytest")?.as_table()?;
+    // [tool.pytest.ini_options] (ini mode) or [tool.pytest] minus that key
+    // (toml mode); a [tool.pytest] table holding ONLY ini_options is not
+    // itself a config.
+    if let Some(ini) = pytest.get("ini_options").and_then(|v| v.as_table()) {
+        return Some(extract_toml_options(ini));
+    }
+    if pytest.is_empty() {
         return None;
     }
-    Some(options)
+    Some(extract_toml_options(pytest))
 }
 
 /// Minimal INI reader: `key = value` pairs plus indented continuation lines,

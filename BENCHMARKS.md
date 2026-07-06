@@ -41,9 +41,9 @@ is a documented gap), 0 extras. This suite exercises pytest's own config
 ### Validation matrix (release gate)
 
 `scripts/validate_repos.py` diff-checks a matrix of real repositories at the
-tags matching the installed wheels. As of v0.2, wave 3 adds typer 1,379,
-trio 895 (exact), pillow 5,218 (1 extra: imported platform-predicate guard)
-and aiohttp 4,364 (19 extras: directory marks applied by conftest hooks).
+tags matching the installed wheels. As of v0.2, 19 of 21 matrix repos
+are exact — including pillow 5,218, aiohttp 4,364, typer 1,379, trio 895 —
+with sympy (16 extras) and hypothesis (3) documented-partial.
 Fifteen earlier repos are exact
 (zero missing, zero extras): click 1,686 IDs, jinja2 909, attrs 1,386,
 httpx 1,418, starlette 981, urllib3 2,273, werkzeug 969, requests 633,

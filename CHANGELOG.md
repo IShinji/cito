@@ -4,6 +4,16 @@
 
 Initial release.
 
+- Rootdir determination now mirrors pytest's `determine_setup` exactly
+  (read from source): section-less pyproject.toml is only a last-resort
+  anchor, `pytest.toml`/`.pytest.toml`/`.pytest.ini` are recognized, and
+  the setup.py / per-arg / invocation-dir fallback chain is implemented —
+  fixes monorepo subprojects (hypothesis). Deferred branch guards: imported
+  predicate functions with constant returns (`if is_win32():`) and
+  `X = import_module(...)` availability bindings (probed) now decide
+  conditional test definitions; `X = Machine.TestCase` bindings emit
+  synthetic unittest classes (hypothesis stateful). Matrix: 19/21 exact
+  incl. pillow and aiohttp; sympy 16 extras, hypothesis 3.
 - Third validation wave (typer, trio exact; pillow 1 extra; aiohttp 19):
   platform/argv guard conditions (`sys.platform == ...`,
   `"--flag" in sys.argv`) are constant-evaluated, so platform-gated

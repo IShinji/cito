@@ -37,10 +37,11 @@ MATRIX = [
     ("black", "https://github.com/psf/black", ["{v}", "v{v}"], [], [], 0),
     ("pydantic", "https://github.com/pydantic/pydantic", ["v{v}", "{v}"], [], [], 0),
     ("fastapi", "https://github.com/fastapi/fastapi", ["{v}", "v{v}"], [], [], 0),
-    ("sympy", "https://github.com/sympy/sympy", ["sympy-{v}", "{v}"], [], [], 45),
-    # pillow: 1 extra = tests guarded by an imported platform predicate
-    # (`if is_win32():`), beyond static reach.
-    ("pillow", "https://github.com/python-pillow/Pillow", ["{v}", "v{v}"], [], [], 1),
+    ("sympy", "https://github.com/sympy/sympy", ["sympy-{v}", "{v}"], [], [], 20),
+    ("pillow", "https://github.com/python-pillow/Pillow", ["{v}", "v{v}"], [], [], 0),
+    # hypothesis: 3 extras = unittest generator-method dynamics in its own
+    # asyncio wrappers.
+    ("hypothesis", "https://github.com/HypothesisWorks/hypothesis", ["v{v}", "hypothesis-python-{v}"], ["hypothesis/tests/cover"], [], 3),
 
     ("typer", "https://github.com/fastapi/typer", ["{v}", "v{v}"], [], [], 0),
     ("trio", "https://github.com/python-trio/trio", ["v{v}", "{v}"], [], [], 0),
