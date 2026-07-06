@@ -58,6 +58,8 @@ pub struct DecoratorInfo {
     pub expansion: Expansion,
     /// Fixture names pulled in via `@pytest.mark.usefixtures(...)`.
     pub extra_fixture_requests: Vec<String>,
+    /// Mark names (`@pytest.mark.slow` -> "slow"), for `-m` filtering.
+    pub marks: Vec<String>,
 }
 
 /// Analyze a decorator list. Multiple stacked `parametrize` decorators
@@ -69,9 +71,13 @@ pub struct DecoratorInfo {
 pub fn from_decorators(decorators: &[ast::Decorator], aliases: &ParamAliases) -> DecoratorInfo {
     let mut sets: Vec<Vec<String>> = Vec::new();
     let mut extra_fixture_requests = Vec::new();
+    let mut marks = Vec::new();
     let mut poisoned = false;
     let mut parametrized = false;
     for decorator in decorators {
+        if let Some(name) = mark_name(&decorator.expression) {
+            marks.push(name);
+        }
         match &decorator.expression {
             Expr::Call(call) if is_parametrize(&call.func) => {
                 parametrized = true;
@@ -130,7 +136,21 @@ pub fn from_decorators(decorators: &[ast::Decorator], aliases: &ParamAliases) ->
     DecoratorInfo {
         expansion,
         extra_fixture_requests,
+        marks,
     }
+}
+
+/// `pytest.mark.NAME` / `mark.NAME`, bare or called — the NAME, for `-m`.
+pub fn mark_name(expr: &Expr) -> Option<String> {
+    let target = match expr {
+        Expr::Call(call) => &*call.func,
+        other => other,
+    };
+    let chain = dotted(target)?;
+    let mut segments = chain.split('.').rev();
+    let last = segments.next()?;
+    let parent = segments.next()?;
+    (parent == "mark" && last != "mark").then(|| last.to_string())
 }
 
 /// Record `NAME = pytest.mark.parametrize(...)` module-level aliases.

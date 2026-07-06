@@ -72,6 +72,9 @@ pub struct Config {
     pub rootdir: PathBuf,
     pub source: Option<PathBuf>,
     pub testpaths: Vec<String>,
+    /// Raw addopts entries (whitespace/array split) — used only to warn
+    /// about interactions (e.g. pytest-xdist's -n).
+    pub addopts: Vec<String>,
     python_files: PathPatterns,
     python_classes: Vec<NamePattern>,
     python_functions: Vec<NamePattern>,
@@ -132,6 +135,7 @@ impl Config {
             rootdir,
             source,
             testpaths: options.get("testpaths").cloned().unwrap_or_default(),
+            addopts: options.get("addopts").cloned().unwrap_or_default(),
             python_files: PathPatterns::new(&get("python_files", DEFAULT_FILES)),
             python_classes: get("python_classes", DEFAULT_CLASSES)
                 .iter()

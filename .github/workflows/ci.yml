@@ -41,6 +41,9 @@ jobs:
         run: |
           uv run --no-project --with pytest scripts/diff_collect.py tests/fixtures/basic
           uv run --no-project --with pytest scripts/diff_collect.py tests/fixtures/configured
+      - name: Differential check with -m deselection
+        run: |
+          uv run --no-project --with pytest scripts/diff_collect.py tests/fixtures/basic -- -m "not slow"
       - name: Differential check with plugins (asyncio, hypothesis)
         run: |
           uv run --no-project --with pytest --with pytest-asyncio --with hypothesis \

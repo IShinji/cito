@@ -77,6 +77,8 @@ $ cito run -x                     # stop at first failure (--maxfail N)
 $ cito run --json                 # machine-readable summary for agents/CI
 $ cito run -- --cov=mypkg         # pass anything through to pytest; parallel
                                   # coverage fragments are combined for you
+$ cito run -m "not slow"          # mark expressions, filtered at collection time
+$ cito run --changed              # only files whose content changed since last run
 ```
 
 - **Configuration discovery**: `pytest.ini`, `pyproject.toml` (`[tool.pytest]`
@@ -107,13 +109,19 @@ $ cito run -- --cov=mypkg         # pass anything through to pytest; parallel
   Corpus numbers: serial pytest 2.48 s → `cito run -n 8` 1.24 s → `--warm`
   1.20 s.
 - **Scheduling**: failures are recorded in `.cito/lastfailed` (rootdir);
-  every run schedules previously-failed files first, then most-recently
-  modified files — the fastest possible time-to-first-signal. `--lf` runs
+  every run schedules previously-failed files first, then files whose
+  content hash changed since the last run, then most-recently modified —
+  the fastest possible time-to-first-signal. `--changed` runs *only* the
+  changed files. `--lf` runs
   only the recorded failures (the cache clears as they pass). `--watch`
   keeps running: save a test file and only that file reruns.
 - **Node-ID selectors**: `cito run tests/a.py::TestX` and
   `cito collect tests/a.py::test_y` restrict to matching tests, including
   their parametrizations.
+- **Mark expressions**: `-m "not slow"` filters on statically-harvested
+  marks (function, class chain, and module `pytestmark`) *at collection
+  time* — deselected tests are never scheduled at all. Per-parametrize
+  `pytest.param(marks=...)` marks are not filtered (approximation).
 
 ## The compatibility contract
 

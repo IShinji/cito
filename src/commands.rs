@@ -144,13 +144,17 @@ struct Collected {
     config: Config,
 }
 
-fn collect_files(paths: Vec<PathBuf>, probe_python: Option<&str>) -> Collected {
+fn collect_files(
+    paths: Vec<PathBuf>,
+    probe_python: Option<&str>,
+    marker: Option<&keyword::KExpr>,
+) -> Collected {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (root_args, selectors) = parse_selections(paths, &cwd);
     let anchor = discovery_anchor(&root_args, &cwd);
     let config = Config::discover(&anchor);
     let roots = resolve_roots(root_args, &config, &cwd);
-    let mut files = collector::collect(&roots, &config, probe_python);
+    let mut files = collector::collect(&roots, &config, probe_python, marker);
     apply_selectors(&mut files, &selectors);
     Collected {
         files,
@@ -178,6 +182,42 @@ fn read_lastfailed(config: &Config) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn hashes_path(config: &Config) -> PathBuf {
+    config.rootdir.join(".cito").join("hashes")
+}
+
+fn read_hashes(config: &Config) -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(hashes_path(config))
+        .map(|text| {
+            text.lines()
+                .filter_map(|l| l.split_once('\t'))
+                .map(|(h, p)| (p.to_string(), h.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn file_hash(path: &Path) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
+/// Merge content hashes for the files that just ran into the cache.
+fn write_hashes(config: &Config, updates: &std::collections::HashMap<String, String>) {
+    let mut merged = read_hashes(config);
+    merged.extend(updates.clone());
+    let path = hashes_path(config);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut body: Vec<String> = merged.iter().map(|(p, h)| format!("{h}\t{p}")).collect();
+    body.sort();
+    let _ = std::fs::write(&path, body.join("\n") + "\n");
+}
+
 /// Did `candidate` (rootdir-relative `path::test`) fail last time? Bare
 /// candidates also match their bracketed parametrizations.
 fn matches_failure(candidate: &str, entry: &str) -> bool {
@@ -195,9 +235,19 @@ fn file_has_failure(file: &collector::FileTests, previous: &[String]) -> bool {
     })
 }
 
-/// Failed-first, then most-recently-modified first.
-fn order_files(files: Vec<collector::FileTests>, previous: &[String]) -> Vec<collector::FileTests> {
-    let mut keyed: Vec<(bool, std::cmp::Reverse<SystemTime>, collector::FileTests)> = files
+/// Failed-first, then content-changed-since-last-run, then most-recently
+/// modified.
+fn order_files(
+    files: Vec<collector::FileTests>,
+    previous: &[String],
+    changed: &std::collections::HashSet<String>,
+) -> Vec<collector::FileTests> {
+    let mut keyed: Vec<(
+        bool,
+        bool,
+        std::cmp::Reverse<SystemTime>,
+        collector::FileTests,
+    )> = files
         .into_iter()
         .map(|f| {
             let has_failure = !previous.is_empty() && file_has_failure(&f, previous);
@@ -206,11 +256,12 @@ fn order_files(files: Vec<collector::FileTests>, previous: &[String]) -> Vec<col
                 .metadata()
                 .and_then(|m| m.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            (!has_failure, std::cmp::Reverse(mtime), f)
+            let is_changed = changed.contains(&f.path);
+            (!has_failure, !is_changed, std::cmp::Reverse(mtime), f)
         })
         .collect();
-    keyed.sort_by_key(|entry| (entry.0, entry.1));
-    keyed.into_iter().map(|(_, _, f)| f).collect()
+    keyed.sort_by_key(|entry| (entry.0, entry.1, entry.2));
+    keyed.into_iter().map(|(_, _, _, f)| f).collect()
 }
 
 fn filter_lastfailed(files: &mut [collector::FileTests], previous: &[String]) {
@@ -270,6 +321,7 @@ pub fn collect(
     count: bool,
     python: Option<String>,
     kexpr: Option<String>,
+    marker: Option<String>,
 ) -> ExitCode {
     let kexpr = match kexpr.as_deref().map(keyword::parse).transpose() {
         Ok(expr) => expr,
@@ -278,7 +330,14 @@ pub fn collect(
             return ExitCode::FAILURE;
         }
     };
-    let Collected { mut files, .. } = collect_files(paths, python.as_deref());
+    let marker = match marker.as_deref().map(keyword::parse).transpose() {
+        Ok(expr) => expr,
+        Err(err) => {
+            eprintln!("cito: invalid -m expression: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Collected { mut files, .. } = collect_files(paths, python.as_deref(), marker.as_ref());
     if let Some(expr) = &kexpr {
         apply_keyword(&mut files, expr);
     }
@@ -369,7 +428,18 @@ fn run_once(
     purge: &[String],
 ) -> runner::Outcome {
     let previous = read_lastfailed(config);
-    let files = order_files(files, &previous);
+    let stored_hashes = read_hashes(config);
+    let current_hashes: std::collections::HashMap<String, String> = files
+        .iter()
+        .filter(|f| !f.tests.is_empty())
+        .filter_map(|f| file_hash(&f.abs_path).map(|h| (f.path.clone(), h)))
+        .collect();
+    let changed: std::collections::HashSet<String> = current_hashes
+        .iter()
+        .filter(|(p, h)| stored_hashes.get(*p) != Some(*h))
+        .map(|(p, _)| p.clone())
+        .collect();
+    let files = order_files(files, &previous, &changed);
     let rerun_files: Vec<String> = files
         .iter()
         .filter(|f| !f.tests.is_empty())
@@ -409,6 +479,7 @@ fn run_once(
         );
     }
     write_lastfailed(config, &previous, &rerun_files, &outcome.failed_ids);
+    write_hashes(config, &current_hashes);
     outcome
 }
 
@@ -425,6 +496,8 @@ pub fn run(
     kexpr: Option<String>,
     json: bool,
     pytest_args: Vec<String>,
+    marker: Option<String>,
+    changed_only: bool,
 ) -> ExitCode {
     let kexpr = match kexpr.as_deref().map(keyword::parse).transpose() {
         Ok(expr) => expr,
@@ -433,11 +506,29 @@ pub fn run(
             return ExitCode::FAILURE;
         }
     };
+    let marker = match marker.as_deref().map(keyword::parse).transpose() {
+        Ok(expr) => expr,
+        Err(err) => {
+            eprintln!("cito: invalid -m expression: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let Collected {
         mut files,
         roots,
         config,
-    } = collect_files(paths, Some(&python));
+    } = collect_files(paths, Some(&python), marker.as_ref());
+    if config
+        .addopts
+        .iter()
+        .any(|a| a == "-n" || a.starts_with("--numprocesses") || a == "--dist")
+    {
+        eprintln!(
+            "cito: warning: addopts contains pytest-xdist options (-n/--dist); \
+             each cito chunk will nest its own xdist workers — consider removing \
+             them for cito runs"
+        );
+    }
     if let Some(expr) = &kexpr {
         apply_keyword(&mut files, expr);
     }
@@ -447,6 +538,16 @@ pub fn run(
             eprintln!("cito: no previously failed tests recorded; running everything");
         } else {
             filter_lastfailed(&mut files, &previous);
+        }
+    }
+    if changed_only {
+        let stored = read_hashes(&config);
+        for file in files.iter_mut() {
+            let unchanged =
+                file_hash(&file.abs_path).is_some_and(|h| stored.get(&file.path) == Some(&h));
+            if unchanged {
+                file.tests.clear();
+            }
         }
     }
     let options = RunOptions {
@@ -477,7 +578,14 @@ pub fn run(
         );
     }
     if watch {
-        return watch_loop(&config, &roots, &options, pool.as_ref(), kexpr.as_ref());
+        return watch_loop(
+            &config,
+            &roots,
+            &options,
+            pool.as_ref(),
+            kexpr.as_ref(),
+            marker.as_ref(),
+        );
     }
     if collected == 0 {
         // pytest exit code 5: no tests were collected/ran.
@@ -502,12 +610,14 @@ fn note_event(event: Result<notify::Event, notify::Error>, changed: &mut BTreeSe
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn watch_loop(
     config: &Config,
     roots: &[PathBuf],
     options: &RunOptions,
     pool: Option<&WarmPool>,
     kexpr: Option<&keyword::KExpr>,
+    marker: Option<&keyword::KExpr>,
 ) -> ExitCode {
     use notify::{RecursiveMode, Watcher};
 
@@ -580,7 +690,7 @@ fn watch_loop(
             "cito: change detected in {} test file(s); rerunning",
             test_files.len()
         );
-        let mut files = collector::collect(&test_files, config, Some(&options.python));
+        let mut files = collector::collect(&test_files, config, Some(&options.python), marker);
         if let Some(expr) = kexpr {
             apply_keyword(&mut files, expr);
         }

@@ -34,6 +34,9 @@ enum Command {
         /// Only list tests matching this keyword expression.
         #[arg(short = 'k')]
         keyword: Option<String>,
+        /// Only list tests matching this mark expression (e.g. "not slow").
+        #[arg(short = 'm')]
+        marker: Option<String>,
     },
     /// Run tests by fanning collected node IDs out across pytest processes (experimental).
     Run {
@@ -72,6 +75,12 @@ enum Command {
         /// Print a machine-readable JSON summary to stdout after the run.
         #[arg(long, conflicts_with = "watch")]
         json: bool,
+        /// Only run tests matching this mark expression (e.g. "not slow").
+        #[arg(short = 'm')]
+        marker: Option<String>,
+        /// Only run files whose content changed since the last run.
+        #[arg(long)]
+        changed: bool,
         /// Extra arguments passed through to every pytest invocation
         /// (e.g. `cito run -- --cov=mypkg --tb=short`).
         #[arg(last = true)]
@@ -88,7 +97,8 @@ fn main() -> ExitCode {
             count,
             python,
             keyword,
-        } => cito::commands::collect(paths, json, count, python, keyword),
+            marker,
+        } => cito::commands::collect(paths, json, count, python, keyword, marker),
         Command::Run {
             paths,
             workers,
@@ -102,6 +112,8 @@ fn main() -> ExitCode {
             keyword,
             json,
             pytest_args,
+            marker,
+            changed,
         } => {
             let maxfail = if fail_fast { 1 } else { maxfail };
             cito::commands::run(
@@ -116,6 +128,8 @@ fn main() -> ExitCode {
                 keyword,
                 json,
                 pytest_args,
+                marker,
+                changed,
             )
         }
     }

@@ -19,6 +19,12 @@ Initial release.
 - `--python` probe for module-level `pytest.importorskip` requirements.
 - `cito run`: parallel execution across pytest subprocesses; `--warm` keeps
   workers alive across chunks (`pytest.main()` in-process).
+- `-m` mark expressions evaluated at collection time (marks harvested from
+  decorators, class chains, and module pytestmark; CI checks deselection
+  parity against pytest); `--changed` runs only content-changed files;
+  default scheduling is now failed-first, changed-first, recent-first
+  (content hashes in `.cito/hashes`); addopts containing -n/--dist emit an
+  xdist nesting warning.
 - `--` passthrough of arbitrary pytest args to every chunk; parallel-safe
   coverage: each chunk gets its own COVERAGE_FILE and fragments are
   auto-combined into `.coverage` after the run (verified: 2-chunk run of a

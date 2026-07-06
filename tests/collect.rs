@@ -4,7 +4,12 @@ use cito::config::Config;
 
 fn collect_ids(root: &Path, walk: &Path) -> Vec<String> {
     let config = Config::discover(root);
-    let files = cito::collector::collect(std::slice::from_ref(&walk.to_path_buf()), &config, None);
+    let files = cito::collector::collect(
+        std::slice::from_ref(&walk.to_path_buf()),
+        &config,
+        None,
+        None,
+    );
     let mut ids: Vec<String> = files
         .iter()
         .flat_map(|file| {
@@ -33,6 +38,8 @@ fn basic_tree_matches_pytest() {
         "helpers_test.py::test_suffix_pattern",
         "sub/test_inner.py::test_in_subdir",
         "test_inherit.py::LegacySuite::test_unittest_style",
+        "test_marks.py::test_marked_slow",
+        "test_marks.py::TestMarkedClass::test_net_call",
         "test_inherit.py::TestInherited::test_own",
         "test_inherit.py::TestInherited::test_second_level",
         "test_inherit.py::TestInherited::test_from_mixin",

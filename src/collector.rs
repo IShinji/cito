@@ -48,6 +48,7 @@ struct TestDef {
     expansion: Expansion,
     args: Vec<String>,
     claimed: Vec<String>,
+    marks: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -62,6 +63,7 @@ struct Class {
     items: Vec<ClassItem>,
     fixtures: HashMap<String, Fixture>,
     usefixtures: Vec<String>,
+    marks: Vec<String>,
     expansion: Expansion,
     has_ctor: bool,
 }
@@ -95,6 +97,8 @@ struct Module {
     order: Vec<TopItem>,
     /// Module names demanded via module-level `pytest.importorskip(...)`.
     skip_requires: Vec<String>,
+    /// Module-level `pytestmark = ...` mark names.
+    pytestmark: Vec<String>,
     /// conftest.py `collect_ignore` / `collect_ignore_glob` (literal lists).
     collect_ignore: Vec<String>,
     collect_ignore_glob: Vec<String>,
@@ -166,6 +170,7 @@ fn test_def(func: &ast::StmtFunctionDef, aliases: &params::ParamAliases) -> Test
         expansion: info.expansion,
         args,
         claimed: params::decorator_argnames(&func.decorator_list),
+        marks: info.marks,
     }
 }
 
@@ -254,6 +259,7 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
         fixtures: HashMap::new(),
         order: Vec::new(),
         skip_requires: Vec::new(),
+        pytestmark: Vec::new(),
         collect_ignore: Vec::new(),
         collect_ignore_glob: Vec::new(),
         has_generate_tests: false,
@@ -300,6 +306,14 @@ fn scan(stmts: &[Stmt], module: &mut Module, aliases: &mut params::ParamAliases,
                 if let [Expr::Name(target)] = assign.targets.as_slice() {
                     if let Some(alias) = params::parametrize_alias(&assign.value) {
                         aliases.insert(target.id.to_string(), alias);
+                    }
+                    if target.id.as_str() == "pytestmark" {
+                        match &*assign.value {
+                            Expr::List(l) => module
+                                .pytestmark
+                                .extend(l.elts.iter().filter_map(params::mark_name)),
+                            other => module.pytestmark.extend(params::mark_name(other)),
+                        }
                     }
                     // conftest collect_ignore lists (literal entries only).
                     if matches!(target.id.as_str(), "collect_ignore" | "collect_ignore_glob") {
@@ -446,6 +460,7 @@ fn build_class(class: &ast::StmtClassDef, aliases: &params::ParamAliases) -> Cla
         items,
         fixtures,
         usefixtures: class_info.extra_fixture_requests,
+        marks: class_info.marks,
         expansion: class_info.expansion,
         has_ctor,
     }
@@ -766,10 +781,17 @@ print(json.dumps(result))
         class: &Class,
         key: (PathBuf, String),
         visited: &mut HashSet<(PathBuf, String)>,
-    ) -> (Vec<TestDef>, bool, bool, HashMap<String, Fixture>) {
+    ) -> (
+        Vec<TestDef>,
+        bool,
+        bool,
+        HashMap<String, Fixture>,
+        Vec<String>,
+    ) {
         visited.insert(key);
         let mut methods: Vec<TestDef> = Vec::new();
         let mut chain_fixtures: HashMap<String, Fixture> = class.fixtures.clone();
+        let mut chain_marks: Vec<String> = class.marks.clone();
         let mut seen: HashSet<String> = HashSet::new();
         for item in &class.items {
             if let ClassItem::Method(def) = item {
@@ -804,13 +826,14 @@ print(json.dumps(result))
                     };
                     base_params |= target_class.expansion != Expansion::None
                         || has_autouse_params(&target_class.fixtures);
-                    let (inherited, base_ut, base_bp, base_fixtures) =
+                    let (inherited, base_ut, base_bp, base_fixtures, base_marks) =
                         self.resolve_class(&target_mod, target_class, key, visited);
                     unittest |= base_ut;
                     base_params |= base_bp;
                     for (name, fixture) in base_fixtures {
                         chain_fixtures.entry(name).or_insert(fixture);
                     }
+                    chain_marks.extend(base_marks);
                     for def in inherited {
                         if seen.insert(def.name.clone()) {
                             methods.push(def);
@@ -820,7 +843,7 @@ print(json.dumps(result))
                 BaseTarget::Unknown => {}
             }
         }
-        (methods, unittest, base_params, chain_fixtures)
+        (methods, unittest, base_params, chain_fixtures, chain_marks)
     }
 }
 
@@ -850,7 +873,12 @@ fn is_unittest_ref(mref: &ModuleRef, name: &str) -> bool {
 
 /// Collect tests from all roots, honoring `config`. Test files are parsed in
 /// parallel; base-class modules are parsed lazily during resolution.
-pub fn collect(roots: &[PathBuf], config: &Config, probe_python: Option<&str>) -> Vec<FileTests> {
+pub fn collect(
+    roots: &[PathBuf],
+    config: &Config,
+    probe_python: Option<&str>,
+    marker: Option<&crate::keyword::KExpr>,
+) -> Vec<FileTests> {
     let files = discover(roots, config);
     let parsed: Vec<Option<Module>> = files.par_iter().map(|p| parse_file(p)).collect();
 
@@ -878,7 +906,7 @@ pub fn collect(roots: &[PathBuf], config: &Config, probe_python: Option<&str>) -
         .map(|abs| {
             let tests = resolver
                 .module(abs)
-                .map(|module| emit_module(&mut resolver, &module))
+                .map(|module| emit_module(&mut resolver, &module, marker))
                 .unwrap_or_default();
             FileTests {
                 path: display_path(abs, &config.rootdir),
@@ -897,13 +925,17 @@ pub fn collect_source(source: &str, config: &Config) -> Vec<String> {
         Ok(module) => {
             let mut resolver = Resolver::new(config, None);
             let module = Rc::new(module);
-            emit_module(&mut resolver, &module)
+            emit_module(&mut resolver, &module, None)
         }
         Err(_) => Vec::new(),
     }
 }
 
-fn emit_module(resolver: &mut Resolver, module: &Rc<Module>) -> Vec<String> {
+fn emit_module(
+    resolver: &mut Resolver,
+    module: &Rc<Module>,
+    marker: Option<&crate::keyword::KExpr>,
+) -> Vec<String> {
     // Fixture visibility for tests in this module: the module itself plus
     // its conftest chain.
     let mut contexts = vec![module.clone()];
@@ -954,6 +986,17 @@ fn emit_module(resolver: &mut Resolver, module: &Rc<Module>) -> Vec<String> {
         match item {
             TopItem::Func(def) => {
                 if resolver.config.function_matches(&def.name) {
+                    if let Some(expr) = marker {
+                        let names: HashSet<String> = module
+                            .pytestmark
+                            .iter()
+                            .chain(def.marks.iter())
+                            .cloned()
+                            .collect();
+                        if !expr.matches_names(&names) {
+                            continue;
+                        }
+                    }
                     let mut expansion = if def.expansion != Expansion::None
                         && requests_parametrized_fixture(&contexts, &[], def)
                     {
@@ -978,6 +1021,7 @@ fn emit_module(resolver: &mut Resolver, module: &Rc<Module>) -> Vec<String> {
                     name,
                     &contexts,
                     poisoned,
+                    marker,
                     &mut Vec::new(),
                     &mut tests,
                 );
@@ -995,12 +1039,13 @@ fn emit_class(
     name: &str,
     contexts: &[Rc<Module>],
     poisoned: bool,
+    marker: Option<&crate::keyword::KExpr>,
     stack: &mut Vec<String>,
     out: &mut Vec<String>,
 ) {
     let mut visited = HashSet::new();
     let key = (module.path.clone(), name.to_string());
-    let (methods, unittest, base_params, chain_fixtures) =
+    let (methods, unittest, base_params, chain_fixtures, chain_marks) =
         resolver.resolve_class(module, class, key, &mut visited);
     // The class chain's parametrized autouse fixtures poison exact
     // expansion for all of its methods.
@@ -1026,6 +1071,18 @@ fn emit_class(
         if !matches {
             continue;
         }
+        if let Some(expr) = marker {
+            let names: HashSet<String> = module
+                .pytestmark
+                .iter()
+                .chain(chain_marks.iter())
+                .chain(def.marks.iter())
+                .cloned()
+                .collect();
+            if !expr.matches_names(&names) {
+                continue;
+            }
+        }
         // Any exact expansion — the method's own or one applied by the
         // class — is invalid if the test requests a parametrized fixture
         // (leaf-module visibility applies to inherited methods too).
@@ -1050,6 +1107,7 @@ fn emit_class(
                 nested_name,
                 contexts,
                 poisoned,
+                marker,
                 stack,
                 out,
             );

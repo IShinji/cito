@@ -13,13 +13,24 @@ pub enum KExpr {
 }
 
 impl KExpr {
-    /// `candidate` must already be lowercased.
+    /// `-k` semantics: case-insensitive substring. `candidate` must already
+    /// be lowercased.
     pub fn matches(&self, candidate: &str) -> bool {
         match self {
             KExpr::Or(a, b) => a.matches(candidate) || b.matches(candidate),
             KExpr::And(a, b) => a.matches(candidate) && b.matches(candidate),
             KExpr::Not(inner) => !inner.matches(candidate),
-            KExpr::Frag(frag) => candidate.contains(frag.as_str()),
+            KExpr::Frag(frag) => candidate.contains(frag.to_lowercase().as_str()),
+        }
+    }
+
+    /// `-m` semantics: exact, case-sensitive mark-name membership.
+    pub fn matches_names(&self, names: &std::collections::HashSet<String>) -> bool {
+        match self {
+            KExpr::Or(a, b) => a.matches_names(names) || b.matches_names(names),
+            KExpr::And(a, b) => a.matches_names(names) && b.matches_names(names),
+            KExpr::Not(inner) => !inner.matches_names(names),
+            KExpr::Frag(frag) => names.contains(frag.as_str()),
         }
     }
 }
@@ -105,7 +116,7 @@ impl Parser {
                 if token == "and" || token == "or" {
                     return Err(format!("unexpected keyword {token:?}"));
                 }
-                Ok(KExpr::Frag(token.to_lowercase()))
+                Ok(KExpr::Frag(token))
             }
             None => Err("unexpected end of expression".to_string()),
         }
@@ -144,6 +155,16 @@ mod tests {
         assert!(m("grpc or http", "test_api.py::TestHttp::test_get"));
         assert!(m("not (grpc or ftp)", "test_api.py::TestHttp::test_get"));
         assert!(m("TESTHTTP", "test_api.py::testhttp::test_get"));
+    }
+
+    #[test]
+    fn mark_name_matching() {
+        let names: std::collections::HashSet<String> =
+            ["slow".to_string(), "network".to_string()].into();
+        assert!(parse("slow").unwrap().matches_names(&names));
+        assert!(!parse("not slow").unwrap().matches_names(&names));
+        assert!(parse("slow and network").unwrap().matches_names(&names));
+        assert!(!parse("SLOW").unwrap().matches_names(&names)); // case-sensitive
     }
 
     #[test]
