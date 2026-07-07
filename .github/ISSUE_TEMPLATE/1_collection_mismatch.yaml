@@ -1,0 +1,50 @@
+name: Collection mismatch
+description: cito collects different node IDs than pytest on your project
+labels: ["collection-parity"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Mismatch reports are the most valuable issue this project can
+        receive — thank you. The two commands below produce everything
+        needed.
+  - type: textarea
+    id: diff
+    attributes:
+      label: The diff
+      description: >
+        Run both collectors and paste the first ~20 differing lines.
+      value: |
+        ```bash
+        python -m pytest --collect-only -q | sort > pytest.txt
+        cito collect --python $(which python) | sort > cito.txt
+        diff pytest.txt cito.txt | head -20
+        ```
+        Output:
+        ```
+        (paste here)
+        ```
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: "cito 0.3.0, pytest 8.4.2, Python 3.12, macOS"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: pytest configuration
+      description: >
+        The `[tool.pytest.ini_options]` / `pytest.ini` / `tox.ini` section,
+        plus any conftest.py machinery near the mismatching file
+        (pytest_generate_tests, custom collectors, parametrize helpers).
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproducing file
+      description: >
+        If you can trim the mismatching test file down, paste it —
+        otherwise a link to the repository and file path works.

@@ -5,6 +5,24 @@ output where pytest compatibility requires it; patch versions are fixes
 only. 1.0 will freeze the CLI surface and the node-ID compatibility
 contract documented in the README.
 
+## 0.3.0 (unreleased)
+
+- `--changed` is now AST-level impact analysis: a test file runs when it,
+  a conftest above it, the config file, or any project file it
+  transitively imports changed since the last run. Resolution follows the
+  project import graph (absolute, relative, `src/` layout, package roots,
+  conftest `pytest_plugins`) and treats third-party packages as stable.
+  `.cito/hashes` now records the whole dependency closure on `--changed`
+  runs; plain runs still record test files only, and a dependency without
+  a recorded baseline counts as changed — conservative in the safe
+  direction. With `--watch --changed`, each save reruns exactly the
+  impacted tests.
+- Plugin compatibility matrix documented in the README — every row backed
+  by a differential-validated repository; roadmap items 3 and 4 are done.
+- Repo hygiene for contributors: CONTRIBUTING.md, SECURITY.md, and issue
+  templates (including a collection-mismatch template that carries the
+  exact diff recipe).
+
 ## 0.2.0 (2026-07-06)
 
 First public release.

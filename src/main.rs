@@ -84,7 +84,9 @@ enum Command {
         /// Ignore this file or directory during collection (repeatable).
         #[arg(long = "ignore")]
         ignore: Vec<PathBuf>,
-        /// Only run files whose content changed since the last run.
+        /// Only run tests impacted by changes since the last run — a test
+        /// file counts as impacted when it, a conftest above it, the config
+        /// file, or any project file it transitively imports changed.
         #[arg(long)]
         changed: bool,
         /// Execute on the per-project warm daemon (started on demand);

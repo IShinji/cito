@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Compatibility contract
+    url: https://github.com/IShinji/cito#the-compatibility-contract
+    about: What cito promises about node IDs, and the honest list of known gaps.

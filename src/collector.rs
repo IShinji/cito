@@ -107,6 +107,10 @@ struct Module {
     dir: PathBuf,
     imports: HashMap<String, Import>,
     star_imports: Vec<ModuleRef>,
+    /// Full dotted names of `import a.b` statements — the binding in
+    /// `imports` keeps only what the namespace sees; impact analysis needs
+    /// the module that actually executes.
+    imported_modules: Vec<String>,
     classes: HashMap<String, Class>,
     functions: HashMap<String, TestDef>,
     fixtures: HashMap<String, Fixture>,
@@ -354,6 +358,7 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
         dir: path.parent().unwrap_or(Path::new("")).to_path_buf(),
         imports: HashMap::new(),
         star_imports: Vec::new(),
+        imported_modules: Vec::new(),
         classes: HashMap::new(),
         functions: HashMap::new(),
         fixtures: HashMap::new(),
@@ -519,6 +524,9 @@ fn scan(
             Stmt::Import(import) => {
                 for alias in &import.names {
                     let dotted = alias.name.to_string();
+                    // The full dotted module executes regardless of the
+                    // binding shape — impact analysis needs it.
+                    module.imported_modules.push(dotted.clone());
                     match &alias.asname {
                         Some(asname) => {
                             module
@@ -1550,6 +1558,125 @@ pub fn collect(
             }
         })
         .collect()
+}
+
+/// AST-level impact analysis: for each test file, the set of project files
+/// whose change can affect it — the file itself, the conftest chain above
+/// it (plus conftest-declared pytest_plugins modules), the config file, and
+/// the transitive closure of imports that resolve inside the rootdir.
+/// Third-party modules are treated as stable, so resolution never leaves
+/// the project. Keys and members are rootdir-relative forward-slash paths
+/// (the `FileTests::path` convention).
+pub fn impact_closures(config: &Config, files: &[FileTests]) -> HashMap<String, HashSet<String>> {
+    let mut resolver = Resolver::new(config, None);
+    let config_key = config
+        .source
+        .as_ref()
+        .map(|src| display_path(src, &config.rootdir));
+    let mut direct: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut closures = HashMap::new();
+    for file in files {
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut stack: Vec<PathBuf> = vec![file.abs_path.clone()];
+        if let Some(dir) = file.abs_path.parent() {
+            for conftest in resolver.conftest_chain(dir) {
+                stack.push(conftest.path.clone());
+            }
+        }
+        while let Some(path) = stack.pop() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            if !direct.contains_key(&path) {
+                let deps = direct_deps(&mut resolver, &path);
+                direct.insert(path.clone(), deps);
+            }
+            for dep in &direct[&path] {
+                if !seen.contains(dep) {
+                    stack.push(dep.clone());
+                }
+            }
+        }
+        let mut keys: HashSet<String> = seen
+            .iter()
+            .map(|p| display_path(p, &config.rootdir))
+            .collect();
+        if let Some(key) = &config_key {
+            keys.insert(key.clone());
+        }
+        closures.insert(file.path.clone(), keys);
+    }
+    closures
+}
+
+/// Project-local files a module imports directly: absolute imports resolved
+/// against the rootdir (and `src/` or the importer's package root), relative
+/// imports against the importer, plus conftest `pytest_plugins` modules.
+/// Only paths under the rootdir count.
+fn direct_deps(resolver: &mut Resolver, path: &Path) -> Vec<PathBuf> {
+    let Some(module) = resolver.module(path) else {
+        return Vec::new();
+    };
+    let mut refs: Vec<ModuleRef> = Vec::new();
+    for dotted in &module.imported_modules {
+        refs.push(ModuleRef::Absolute(dotted.clone()));
+    }
+    for import in module.imports.values() {
+        match import {
+            Import::Module(dotted) => refs.push(ModuleRef::Absolute(dotted.clone())),
+            Import::From(mref, name) => {
+                refs.push(mref.clone());
+                refs.push(resolver.resolve_child(mref, name));
+            }
+        }
+    }
+    refs.extend(module.star_imports.iter().cloned());
+    for plugin in &module.plugin_modules {
+        refs.push(ModuleRef::Absolute(plugin.clone()));
+    }
+    let rootdir = resolver.config.rootdir.clone();
+    let mut deps: HashSet<PathBuf> = HashSet::new();
+    for mref in refs {
+        for candidate in local_candidates(resolver.config, &mref, &module.dir) {
+            if !candidate.starts_with(&rootdir) {
+                continue;
+            }
+            if let Some(dep) = resolver.module(&candidate) {
+                deps.insert(dep.path.clone());
+                break;
+            }
+        }
+    }
+    deps.into_iter().collect()
+}
+
+/// Candidate files for a module reference, restricted to project roots —
+/// `resolve_ref`'s search order minus the interpreter's sys.path.
+fn local_candidates(config: &Config, mref: &ModuleRef, importer_dir: &Path) -> Vec<PathBuf> {
+    match mref {
+        ModuleRef::Relative(base) => {
+            vec![base.with_extension("py"), base.join("__init__.py")]
+        }
+        ModuleRef::Absolute(dotted) => {
+            let mut rel = PathBuf::new();
+            for seg in dotted.split('.') {
+                rel = rel.join(seg);
+            }
+            let mut roots = vec![config.rootdir.clone(), config.rootdir.join("src")];
+            if let Some(pkg_root) = package_root_above(importer_dir) {
+                roots.push(pkg_root);
+            }
+            roots
+                .iter()
+                .flat_map(|root| {
+                    [
+                        root.join(&rel).with_extension("py"),
+                        root.join(&rel).join("__init__.py"),
+                    ]
+                })
+                .collect()
+        }
+    }
 }
 
 /// Collect from a single source string (used by unit tests); same-module

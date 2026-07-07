@@ -1,0 +1,13 @@
+name: Feature request
+description: Something cito should do
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: request
+    attributes:
+      label: The workflow you want
+      description: >
+        Describe the workflow, not just the flag — what are you doing when
+        you miss this, and what does pytest (or another runner) do today?
+    validations:
+      required: true

@@ -10,7 +10,8 @@ and [uv](https://github.com/astral-sh/uv) did for linting and packaging. It
 discovers your tests by parsing them with ruff's parser — in milliseconds, not
 seconds — and verifies against real pytest that it finds the same node IDs.
 
-> **Status: v0.2.** Collection is differential-tested against ~40 real
+> **Status: v0.3 (unreleased on main; 0.2.0 on PyPI).** Collection is
+> differential-tested against ~40 real
 > suites — pytest's own, pandas, home-assistant, sphinx, pip — plus 100 fuzz
 > seeds; ~640k node IDs checked in total. The runner does parallel
 > subprocesses, warm in-process workers, and a per-project daemon that makes
@@ -128,7 +129,7 @@ $ cito run --json                 # machine-readable summary for agents/CI
 $ cito run -- --cov=mypkg         # pass anything through to pytest; parallel
                                   # coverage fragments are combined for you
 $ cito run -m "not slow"          # mark expressions, filtered at collection time
-$ cito run --changed              # only files whose content changed since last run
+$ cito run --changed              # only tests impacted by changes (AST import graph)
 $ cito run --daemon               # hit the per-project warm daemon: one-shot
                                   # runs in ~0.02s (auto-starts; unix)
 $ cito daemon status              # start | stop | status
@@ -162,12 +163,18 @@ $ cito daemon status              # start | stop | status
   Corpus numbers: serial pytest 2.48 s → `cito run -n 8` 1.24 s → `--warm`
   1.20 s.
 - **Scheduling**: failures are recorded in `.cito/lastfailed` (rootdir);
-  every run schedules previously-failed files first, then files whose
-  content hash changed since the last run, then most-recently modified —
-  the fastest possible time-to-first-signal. `--changed` runs *only* the
-  changed files. `--lf` runs
-  only the recorded failures (the cache clears as they pass). `--watch`
-  keeps running: save a test file and only that file reruns.
+  every run schedules previously-failed files first, then changed files,
+  then most-recently modified — the fastest possible time-to-first-signal.
+  `--lf` runs only the recorded failures (the cache clears as they pass).
+  `--watch` keeps running: save a test file and only that file reruns.
+- **Impact analysis** (`--changed`): runs only the tests a change can
+  actually reach — a test file counts as impacted when it, a conftest
+  above it, the config file, or **any project file it transitively
+  imports** changed since the last run. Change one core module and exactly
+  the tests that import it (directly or through other project modules)
+  run; touch nothing and `cito run --changed` runs nothing. Resolution is
+  AST-level and stays inside the project — third-party packages are
+  treated as stable.
 - **Node-ID selectors**: `cito run tests/a.py::TestX` and
   `cito collect tests/a.py::test_y` restrict to matching tests, including
   their parametrizations.
@@ -212,16 +219,42 @@ Known gaps, tracked honestly:
   supported; computed appends are not), and plugins that redefine
   collection semantics outright (pytest-relaxed)
 
+## Plugin compatibility
+
+Plugins run untouched at execution time — cito hands pytest real node IDs
+and pytest loads your plugins as always. What matters for cito is whether a
+plugin changes *collection*; this matrix is the current, tested state:
+
+| plugin | collection-time behavior | status | evidence |
+|---|---|---|---|
+| pytest-asyncio | async tests collected normally | supported | its own suite (299 IDs exact), aiohttp, home-assistant |
+| anyio | backend fixture parametrizes tests | supported (declared fallback) | httpx 1,418 / starlette 981 exact |
+| pytest-django | standard collection | supported | django-rest-framework 1,552 exact |
+| hypothesis | `@given` wraps, IDs unchanged | supported | hypothesis suite, pandas |
+| pytest-xdist | none (runtime distribution) | compatible — cito schedules its own workers; pass `-n` through `--` if you must | pytest-xdist suite 212 exact |
+| pytest-cov | none (runtime) | supported — per-chunk `COVERAGE_FILE` isolation, auto-combine | coverage.py suite 1,586 exact |
+| pytest-mock | none (fixture) | compatible | used across validated repos |
+| pytest-timeout | none (runtime) | compatible | home-assistant venv |
+| syrupy / snapshot plugins | none (fixture/report) | compatible | home-assistant, textual 3,467 exact |
+| pytest-socket | none (runtime guard) | compatible | pip 2,997 exact (its addopts require it) |
+| pytest-rerunfailures / flaky | none (runtime reruns) | compatible | pytest's own suite |
+| pytest-randomly | runtime ordering only | compatible (cito orders files; in-chunk order is pytest's) | — |
+| pytest-relaxed | **rewrites collection semantics** | not supported (documented out) | paramiko |
+| ipython ipdoctest, doctest plugins | **collect non-test sources** | not supported (doctest is a known gap) | ipython, dateutil |
+| custom `pytest_collect_file` collectors | **turn arbitrary files into tests** | not supported by design | pygments, sqlalchemy/django bootstrap plugins |
+
 ## Architecture
 
 1. **v0.1 — collection parity + speed**: shipped.
 2. **v0.2 — warm workers**: shipped — `--warm` pools within a run, `--watch`
    keeps them across saves, and `cito run --daemon` keeps them across CLI
    invocations (workers self-purge modules whose files changed).
-3. **v0.3 — scheduling**: mostly shipped (failed-first, content-changed-first,
-   `--lf`, `--changed`, `--json`); remaining: AST-level impact analysis.
-4. **Plugin compatibility matrix**: explicit, tested support for the top-20
-   pytest plugins (xdist, cov, asyncio, django, hypothesis, mock, ...).
+3. **v0.3 — scheduling**: shipped — failed-first, `--lf`, `--json`, and
+   AST-level impact analysis (`--changed` follows the project import graph,
+   conftest chain, and config).
+4. **Plugin compatibility matrix**: shipped — see
+   [Plugin compatibility](#plugin-compatibility); each row is backed by a
+   differential-validated repository.
 
 ## Non-goals
 

@@ -402,6 +402,9 @@ struct RunOptions {
     extra_args: Vec<String>,
     coverage_base: String,
     daemon: bool,
+    /// Only run tests impacted by changes since the last run (AST-level:
+    /// own file, conftest chain, config, or transitive project imports).
+    changed_only: bool,
 }
 
 /// If any per-chunk coverage files were produced (the runners point
@@ -452,16 +455,59 @@ fn run_once(
 ) -> runner::Outcome {
     let previous = read_lastfailed(config);
     let stored_hashes = read_hashes(config);
-    let current_hashes: std::collections::HashMap<String, String> = files
-        .iter()
-        .filter(|f| !f.tests.is_empty())
-        .filter_map(|f| file_hash(&f.abs_path).map(|h| (f.path.clone(), h)))
-        .collect();
-    let changed: std::collections::HashSet<String> = current_hashes
-        .iter()
-        .filter(|(p, h)| stored_hashes.get(*p) != Some(*h))
-        .map(|(p, _)| p.clone())
-        .collect();
+    // Under --changed, impact analysis hashes every file in each test
+    // file's dependency closure: a test is impacted when anything it
+    // depends on is new, modified, or gone since the last run. Plain runs
+    // hash only the test files themselves (a dep without a recorded
+    // baseline counts as changed on the next --changed run — conservative
+    // in the safe direction).
+    let (changed, current_hashes) = if options.changed_only {
+        let closures = collector::impact_closures(config, &files);
+        let mut current: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for dep in closures.values().flatten() {
+            if !current.contains_key(dep) {
+                if let Some(hash) = file_hash(&config.rootdir.join(dep)) {
+                    current.insert(dep.clone(), hash);
+                }
+            }
+        }
+        let changed: std::collections::HashSet<String> = files
+            .iter()
+            .filter(|f| {
+                closures.get(&f.path).is_none_or(|deps| {
+                    deps.iter()
+                        .any(|dep| current.get(dep) != stored_hashes.get(dep))
+                })
+            })
+            .map(|f| f.path.clone())
+            .collect();
+        (changed, current)
+    } else {
+        let current: std::collections::HashMap<String, String> = files
+            .iter()
+            .filter(|f| !f.tests.is_empty())
+            .filter_map(|f| file_hash(&f.abs_path).map(|h| (f.path.clone(), h)))
+            .collect();
+        let changed: std::collections::HashSet<String> = current
+            .iter()
+            .filter(|(p, h)| stored_hashes.get(*p) != Some(*h))
+            .map(|(p, _)| p.clone())
+            .collect();
+        (changed, current)
+    };
+    let mut files = files;
+    if options.changed_only {
+        if stored_hashes.is_empty() {
+            eprintln!("cito: no previous run recorded; running everything");
+        } else {
+            for file in files.iter_mut() {
+                if !changed.contains(&file.path) {
+                    file.tests.clear();
+                }
+            }
+        }
+    }
     let files = order_files(files, &previous, &changed);
     let rerun_files: Vec<String> = files
         .iter()
@@ -592,16 +638,6 @@ pub fn run(
             filter_lastfailed(&mut files, &previous);
         }
     }
-    if changed_only {
-        let stored = read_hashes(&config);
-        for file in files.iter_mut() {
-            let unchanged =
-                file_hash(&file.abs_path).is_some_and(|h| stored.get(&file.path) == Some(&h));
-            if unchanged {
-                file.tests.clear();
-            }
-        }
-    }
     if use_daemon && !cfg!(unix) {
         eprintln!("cito: --daemon is only supported on unix platforms");
         return ExitCode::FAILURE;
@@ -614,6 +650,7 @@ pub fn run(
         extra_args: pytest_args,
         coverage_base: config.rootdir.join(".coverage.cito").display().to_string(),
         daemon: use_daemon,
+        changed_only,
     };
     let pool =
         (warm_workers && !use_daemon).then(|| WarmPool::new(&options.python, options.workers));

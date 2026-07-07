@@ -1,0 +1,23 @@
+name: Bug report
+description: Crash, wrong runner behavior, or anything else that isn't a collection mismatch
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: "cito 0.3.0, pytest 8.4.2, Python 3.12, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Full command and output
+      render: shell
