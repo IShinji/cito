@@ -4,6 +4,16 @@
 
 Initial release.
 
+- Sixth validation wave: botocore 78,668 IDs exact (module re-exports in
+  dotted base classes now chase through package __init__ import bindings —
+  `from tests import unittest`), tox 7,929, openai-python 6,731,
+  coverage.py 1,586 (validated against a pytest-9 oracle: its native
+  [tool.pytest] table with minversion=9 is invisible to pytest 8 — cito
+  implements pytest-9 semantics), virtualenv 328 — all zero-diff. Oracle
+  hardened against repos whose addopts enable xdist (-n0 with fallback);
+  validate_repos supports a per-entry pytest-9 interpreter. Documented
+  out: dateutil (doctest crash under plugin mix), babel (CLDR build step),
+  celery (cloud-SDK imports at collection).
 - Fifth validation wave: textual 3,467 / pytest-xdist 212 / httpcore 220
   zero-diff; scikit-learn wheel 47,349 IDs with ZERO missing (2 extras);
   scipy wheel 96,387 IDs with 5 extras (missing 3.6% = type() class

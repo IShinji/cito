@@ -60,6 +60,17 @@ MATRIX = [
     # mkdocs (unittest-style *_tests.py suite, not pytest), yt-dlp
     # (setattr-loop generates ~5.8k extractor tests at import time).
     ("textual", "https://github.com/Textualize/textual", ["v{v}", "{v}"], [], [], 0),
+    # coverage declares minversion=9 and uses the native [tool.pytest]
+    # table, which pytest 8 ignores — validate against the pytest-9 venv.
+    ("coverage", "https://github.com/nedbat/coveragepy", ["{v}", "v{v}"], [], [], 0, "9"),
+    ("tox", "https://github.com/tox-dev/tox", ["{v}", "v{v}"], [], [], 0),
+    ("virtualenv", "https://github.com/pypa/virtualenv", ["{v}", "v{v}"], [], [], 0),
+    # Documented out this wave: dateutil (doctest collection of docs/
+    # exercises crashes under the plugin mix), babel (needs the CLDR data
+    # build step before its suite imports), celery (imports azure/google
+    # cloud SDKs at collection — full dev env family).
+    ("botocore", "https://github.com/boto/botocore", ["{v}", "v{v}"], [], [], 0),
+    ("openai", "https://github.com/openai/openai-python", ["v{v}", "{v}"], [], [], 0),
     # aiohttp: ~19 extras = marks applied dynamically by conftest hooks
     # (pytest_collection_modifyitems tagging whole directories) interacting
     # with addopts -m deselection.
@@ -110,6 +121,7 @@ def clone_at(url: str, templates: list, version: str, dest: pathlib.Path) -> boo
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", required=True)
+    parser.add_argument("--python9", default="", help="pytest-9 venv for repos that require it")
     parser.add_argument("--cache", type=pathlib.Path, required=True)
     parser.add_argument("--only", default="")
     args = parser.parse_args()
@@ -117,12 +129,15 @@ def main() -> int:
 
     only = {p for p in args.only.split(",") if p}
     failures = 0
-    for package, url, templates, extra, ignore, max_extra in MATRIX:
+    for entry in MATRIX:
+        package, url, templates, extra, ignore, max_extra = entry[:6]
+        needs = entry[6] if len(entry) > 6 else ""
+        python = args.python9 if needs == "9" and args.python9 else args.python
         if only and package not in only:
             continue
         probe = sh(
             [
-                args.python,
+                python,
                 "-c",
                 f"import importlib.metadata as m; print(m.version({package!r}))",
             ]
@@ -140,7 +155,7 @@ def main() -> int:
             str(REPO / "scripts/diff_collect.py"),
             str(dest),
             "--python",
-            args.python,
+            python,
         ]
         for substr in ignore:
             cmd += ["--ignore-missing", substr]

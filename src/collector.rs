@@ -1350,7 +1350,22 @@ print(json.dumps(result))
                     ModuleRef::Absolute(full)
                 }
                 Some(Import::From(mref, orig)) => {
-                    let mut full = self.resolve_child(&mref, &orig);
+                    // `orig` may be a submodule file, or a module RE-EXPORTED
+                    // by the package (`from tests import unittest` where
+                    // tests/__init__.py does `import unittest`). Prefer the
+                    // re-export when the parent package resolves and binds
+                    // the name as a module import.
+                    let reexported = self.resolve_ref(&mref, &module.dir).and_then(|parent| {
+                        match parent.imports.get(&orig).cloned() {
+                            Some(Import::Module(dotted)) => Some(ModuleRef::Absolute(dotted)),
+                            Some(Import::From(m2, o2)) => Some(self.resolve_child(&m2, &o2)),
+                            None => None,
+                        }
+                    });
+                    let mut full = match reexported {
+                        Some(re) => re,
+                        None => self.resolve_child(&mref, &orig),
+                    };
                     for seg in middle {
                         full = self.resolve_child(&full, seg);
                     }

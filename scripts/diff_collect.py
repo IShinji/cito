@@ -21,13 +21,17 @@ import sys
 
 
 def pytest_ids(target: pathlib.Path, python: str, args: list[str]) -> set[str]:
+    # --verbosity=-1 re-flattens the listing when repo addopts add -v;
+    # -n0 neutralizes xdist when repo addopts add -n auto (falls back when
+    # xdist isn't installed and -n is therefore unknown).
+    base = [python, "-m", "pytest", "--collect-only", "-q", "--verbosity=-1"]
     proc = subprocess.run(
-        # --verbosity=-1 re-flattens the listing when repo addopts add -v.
-        [python, "-m", "pytest", "--collect-only", "-q", "--verbosity=-1", *args],
-        capture_output=True,
-        text=True,
-        cwd=target,
+        [*base, "-n0", *args], capture_output=True, text=True, cwd=target
     )
+    if proc.returncode == 4:
+        proc = subprocess.run(
+            [*base, *args], capture_output=True, text=True, cwd=target
+        )
     if proc.returncode not in (0, 5):
         sys.exit(
             f"pytest --collect-only failed ({proc.returncode}):\n"
