@@ -7,6 +7,23 @@ warm filesystem cache. Collection equivalence is checked with
 
 ## Collection
 
+### home-assistant 2026.7.1 — 81,251 tests
+
+The largest pytest suite in the wild. Clone at the release tag, isolated
+venv pinned to `requirements_test.txt` versions; scope = the core test tree
+plus the 249 integration directories whose dependencies install cleanly
+(the exact scope that passes differential validation with missing=0
+extra=0):
+
+```
+python -m pytest --collect-only -q <scope>          16.91 s
+cito collect --python <venv> <scope>                 0.11 s     (156x)
+```
+
+pytest self-reports 7.30 s of collection; the rest is interpreter startup,
+plugin loading, and home-assistant's conftest import graph — all of which
+cito's static analysis never pays.
+
 ### pandas 3.0.3 — 197,077 tests
 
 Installed wheel (`uv pip install pandas hypothesis "pytest==8.4.2"`), run

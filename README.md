@@ -24,6 +24,7 @@ Collection, wall time (Apple M4 Max, Python 3.14, warm cache; see
 
 | suite | tests | `pytest --collect-only -q` | `cito collect` | speedup |
 |---|---:|---:|---:|---:|
+| home-assistant 2026.7.1 (validated scope) | 81,251 | 16.91 s | **0.11 s** | 156x |
 | pandas 3.0.3 (installed) | 197,077 | 9.48 s | **0.26 s** | 36x |
 | pytest 9.1.1 (own suite) | 4,231 | 0.62 s | **&lt;0.01 s** | &gt;100x |
 | synthetic corpus | 11,000 | 0.70 s | **0.01 s** | 70x |
