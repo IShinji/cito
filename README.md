@@ -10,8 +10,9 @@ and [uv](https://github.com/astral-sh/uv) did for linting and packaging. It
 discovers your tests by parsing them with ruff's parser — in milliseconds, not
 seconds — and verifies against real pytest that it finds the same node IDs.
 
-> **Status: v0.2.** Collection is differential-tested against pytest's own
-> suite, pandas, flask, rich, and 100 fuzz seeds. The runner does parallel
+> **Status: v0.2.** Collection is differential-tested against ~40 real
+> suites — pytest's own, pandas, home-assistant, sphinx, pip — plus 100 fuzz
+> seeds; ~640k node IDs checked in total. The runner does parallel
 > subprocesses, warm in-process workers, and a per-project daemon that makes
 > one-shot runs ~0.02 s. Not yet 1.0; the compatibility contract below is
 > the map.
@@ -32,6 +33,7 @@ And the part that matters more than speed — **the same answers**:
 | suite | pytest IDs | missing | wrong extras |
 |---|---:|---:|---:|
 | pytest's own suite | 4,231 | 1 (a `.txt` doctest; doctest support is a known gap) | 0 |
+| home-assistant 2026.7.1 (core + 249 integrations) | 81,251 | 0 | 0 |
 | pandas 3.0.3 | 197,077 | 26 (0.013%) | 2 |
 | flask 3.1.3 | 482 | 0 | 0 |
 | rich 15.0.0 | 981 | 0 | 0 |
@@ -49,7 +51,7 @@ And the part that matters more than speed — **the same answers**:
 | tornado 6.5.7 | 1,322 | 0 | 0 |
 | black 26.5.1 | 446 | 0 | 0 |
 | pydantic 2.13.4 | 12,775 | 0 | 0 |
-| fastapi 0.139.0 | 3,317 | 0 | 0 |
+| fastapi 0.139.0 | 3,323 | 0 | 0 |
 | sympy 1.14.0 | 13,657 | 0 | 16 (0.1%: custom @SKIP import-time machinery) |
 | typer 0.26.8 | 1,379 | 0 | 0 |
 | networkx 3.6.1 | 7,100 | 0 | 0 |
@@ -66,10 +68,12 @@ And the part that matters more than speed — **the same answers**:
 | openai-python 2.44.0 | 6,731 | 0 | 0 |
 | coverage.py 7.15.0 | 1,586 | 0 | 0 |
 | virtualenv 21.6.0 | 328 | 0 | 0 |
+| sphinx 9.1.0 | 2,424 | 0 | 0 |
+| pip 26.1.2 | 2,997 | 0 | 0 |
 | scipy wheel (site-packages) | 96,387 | 3,467 (3.6%: `type()` class factories) | 5 |
 | numpy 3.x wheel (site-packages) | 49,443 | 760 (1.5%: `type()` loop-generated SIMD classes) | 0 |
 | trio 0.33.0 | 895 | 0 | 0 |
-| pillow 12.3.0 | 5,218 | 0 | 0 |
+| pillow 12.3.0 | 5,219 | 0 | 0 |
 | aiohttp 3.14.1 | 4,364 | 0 | 0 |
 | hypothesis 6.156.1 | 3,647 | 0 | 3 (asyncio wrapper dynamics) |
 
@@ -186,8 +190,9 @@ pytest's node IDs are the interface:
 the fixture trees, a generated corpus, and **randomized differential fuzzing**
 (`bench/fuzz_gen.py` builds seeded projects mixing nested classes,
 cross-module inheritance, re-exports, parametrize variants, fixtures, marks,
-and shadowing; 100 seeds pass locally, three run in CI). Real repositories
-(pytest, pandas, flask, rich) are checked before releases.
+and shadowing; 100 seeds pass locally, three run in CI). ~40 real
+repositories — from flask to pandas to home-assistant — are checked before
+releases via `scripts/validate_repos.py`.
 
 Known gaps, tracked honestly:
 
@@ -197,9 +202,12 @@ Known gaps, tracked honestly:
   including pytest's duplicate-ID suffixes (True0/True1), which always
   fall back
 - `pytest_generate_tests`-generated *extra* tests that add new names
+- import-time class factories that synthesize tests from data files
+  (jsonschema builds ~7k tests from the JSON-Schema-Test-Suite this way)
 - plugin-driven collection hooks and custom collectors (literal
   `collect_ignore` / `collect_ignore_glob` lists in conftest.py ARE
-  supported; computed appends are not)
+  supported; computed appends are not), and plugins that redefine
+  collection semantics outright (pytest-relaxed)
 
 ## Architecture
 

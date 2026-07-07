@@ -4,6 +4,15 @@
 
 Initial release.
 
+- Seventh validation wave — flagship: home-assistant 2026.7.1, the largest
+  pytest suite in the wild. Core tree + the 249 integration dirs whose deps
+  install cleanly: 81,251 node IDs, missing=0 extra=0, no collector changes
+  needed. Also zero-diff: sphinx 2,424, pip 2,997 (its addopts require
+  pytest-socket). Documented out: jsonschema (~7k tests synthesized from
+  JSON-Schema-Test-Suite data files at import time), paramiko
+  (pytest-relaxed redefines collection semantics), langchain-core
+  (pytest-run-parallel plugin conflict in the shared oracle venv),
+  setuptools (its tests/compat shim imports a helper removed in 3.14).
 - Sixth validation wave: botocore 78,668 IDs exact (module re-exports in
   dotted base classes now chase through package __init__ import bindings —
   `from tests import unittest`), tox 7,929, openai-python 6,731,

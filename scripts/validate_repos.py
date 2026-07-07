@@ -71,6 +71,14 @@ MATRIX = [
     # cloud SDKs at collection — full dev env family).
     ("botocore", "https://github.com/boto/botocore", ["{v}", "v{v}"], [], [], 0),
     ("openai", "https://github.com/openai/openai-python", ["v{v}", "{v}"], [], [], 0),
+    ("sphinx", "https://github.com/sphinx-doc/sphinx", ["v{v}", "{v}"], [], [], 0),
+    # Documented out this wave: jsonschema (class factory generates ~7k tests
+    # from the official JSON-Schema-Test-Suite data files at import time),
+    # paramiko (requires pytest-relaxed, which rewrites collection semantics),
+    # langchain-core (pytest-run-parallel in the shared venv INTERNALERRORs
+    # its doctest modules; plugin is required by pydantic), setuptools (its
+    # own tests/compat/py39.py imports a removed stdlib helper on 3.14).
+    ("pip", "https://github.com/pypa/pip", ["{v}", "v{v}"], [], [], 0),
     # aiohttp: ~19 extras = marks applied dynamically by conftest hooks
     # (pytest_collection_modifyitems tagging whole directories) interacting
     # with addopts -m deselection.
@@ -86,6 +94,9 @@ MATRIX = [
     # Skipped by design (documented): sqlalchemy and django test suites
     # require their own collection-bootstrap plugins; pytest itself collects
     # nothing without them.
+    # Validated out-of-matrix (needs its own pinned venv, like the pandas
+    # site-packages track): home-assistant core + the 249 integration dirs
+    # whose deps install cleanly — 81,251 node IDs, missing=0 extra=0.
 ]
 
 
