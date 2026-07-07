@@ -13,8 +13,22 @@ permissions:
   contents: read
 
 jobs:
+  check-version:
+    name: tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$tag" != "$version" ]; then
+            echo "tag v$tag does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
   wheels:
     name: wheel ${{ matrix.platform.target }}
+    needs: [check-version]
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -37,6 +51,7 @@ jobs:
           path: dist
 
   sdist:
+    needs: [check-version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

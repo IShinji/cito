@@ -5,3 +5,4 @@ __pycache__/
 /bench/corpus/
 .venv/
 .cito/
+dist/

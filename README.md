@@ -15,7 +15,9 @@ seconds — and verifies against real pytest that it finds the same node IDs.
 > seeds; ~640k node IDs checked in total. The runner does parallel
 > subprocesses, warm in-process workers, and a per-project daemon that makes
 > one-shot runs ~0.02 s. Not yet 1.0; the compatibility contract below is
-> the map.
+> the map. Pre-1.0 versioning: 0.x minors may change behavior where pytest
+> compatibility requires it, patches are fixes only; 1.0 freezes the CLI and
+> the node-ID contract.
 
 ## Benchmarks
 

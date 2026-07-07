@@ -1,8 +1,13 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+cito is pre-1.0: minor versions (0.x) may change CLI behavior or collection
+output where pytest compatibility requires it; patch versions are fixes
+only. 1.0 will freeze the CLI surface and the node-ID compatibility
+contract documented in the README.
 
-Initial release.
+## 0.2.0 (2026-07-06)
+
+First public release.
 
 - Seventh validation wave — flagship: home-assistant 2026.7.1, the largest
   pytest suite in the wild. Core tree + the 249 integration dirs whose deps
