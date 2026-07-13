@@ -1,38 +1,158 @@
 # cito
 
 [![CI](https://github.com/IShinji/cito/actions/workflows/ci.yml/badge.svg)](https://github.com/IShinji/cito/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/cito.svg)](https://pypi.org/project/cito/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://pypi.org/project/cito/)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **A fast, pytest-compatible test collector and runner, written in Rust.**
 
-*cito* (Latin: "quickly" — the word doctors still write on urgent orders) makes
-the pytest inner loop fast, the way [Ruff](https://github.com/astral-sh/ruff)
-and [uv](https://github.com/astral-sh/uv) did for linting and packaging. It
-discovers your tests by parsing them with ruff's parser — in milliseconds, not
-seconds — and verifies against real pytest that it finds the same node IDs.
+*cito* (Latin: "quickly" — the word doctors still write on urgent orders) does for
+the pytest inner loop what [Ruff](https://github.com/astral-sh/ruff) and
+[uv](https://github.com/astral-sh/uv) did for linting and packaging: reimplement the
+hot path in Rust, treat the existing tool's behavior as a compatibility contract, and
+win by 10–100×. cito discovers your tests by parsing them with Ruff's parser — in
+milliseconds — and verifies against real pytest that it finds the same node IDs.
 
-> **Status: v0.3 (unreleased on main; 0.2.0 on PyPI).** Collection is
-> differential-tested against ~40 real
-> suites — pytest's own, pandas, home-assistant, sphinx, pip — plus 100 fuzz
-> seeds; ~640k node IDs checked in total. The runner does parallel
-> subprocesses, warm in-process workers, and a per-project daemon that makes
-> one-shot runs ~0.02 s. Not yet 1.0; the compatibility contract below is
-> the map. Pre-1.0 versioning: 0.x minors may change behavior where pytest
-> compatibility requires it, patches are fixes only; 1.0 freezes the CLI and
-> the node-ID contract.
+> Collecting home-assistant's 81,251 tests: `pytest --collect-only -q` **16.91 s** →
+> `cito collect` **0.11 s** (156×) — producing the identical node IDs.
 
-## Benchmarks
+*Pre-1.0 and under active development: collection is differentially tested against
+44 real suites (~716k node IDs checked); the runner is a preview. See the
+[FAQ](#faq).*
 
-Collection, wall time (Apple M4 Max, Python 3.14, warm cache; see
-[BENCHMARKS.md](BENCHMARKS.md) to reproduce):
+## Highlights
 
-| suite | tests | `pytest --collect-only -q` | `cito collect` | speedup |
-|---|---:|---:|---:|---:|
-| home-assistant 2026.7.1 (validated scope) | 81,251 | 16.91 s | **0.11 s** | 156x |
-| pandas 3.0.3 (installed) | 197,077 | 9.48 s | **0.26 s** | 36x |
-| pytest 9.1.1 (own suite) | 4,231 | 0.62 s | **&lt;0.01 s** | &gt;100x |
-| synthetic corpus | 11,000 | 0.70 s | **0.01 s** | 70x |
+- ⚡ **Up to 156× faster collection.** `pytest --collect-only` takes seconds to
+  minutes on large suites
+  ([pytest#5516](https://github.com/pytest-dev/pytest/issues/5516)) before a single
+  test runs; cito pays that tax in milliseconds — see [benchmarks](#benchmarks).
+- 🧾 **The same node IDs as pytest, as a contract.** ~716k IDs differentially
+  checked across 44 real suites plus randomized fuzzing, enforced on every commit —
+  see [compatibility](#compatibility).
+- 🔁 **Run only what a change can reach.** `--changed` follows the AST import graph,
+  `--lf` reruns last failures, `--watch` reruns on save.
+- 🔥 **Warm workers and a per-project daemon** put one-shot runs at ~0.02 s.
+- 🧩 **Your plugins keep working** — pytest executes your tests unchanged; a tested
+  [plugin matrix](#plugins) tracks what affects collection.
+- 🤖 **Built for the agent loop.** Coding agents run the suite dozens of times per
+  task, so suite latency is loop latency.
+- 🐍 **Static and configuration-aware.** Discovers `pytest.ini`, `pyproject.toml`,
+  `tox.ini`, and `setup.cfg`; env-aware collection with `--python`.
+- 📦 **A single Rust binary.** `pip install cito` or `uv tool install cito`, no
+  runtime dependencies.
 
-And the part that matters more than speed — **the same answers**:
+## Installation
+
+cito is published to PyPI as a prebuilt wheel — install it with pip or uv:
+
+```console
+$ pip install cito
+$ uv tool install cito       # or, in a project: uv add --dev cito
+```
+
+To build the latest from a checkout you need a Rust toolchain; it builds with
+[maturin](https://maturin.rs) or plain cargo:
+
+```console
+$ uv tool install .          # or: pip install .
+$ cargo install --path .     # Rust-toolchain route
+```
+
+> **PyPI has v0.2.0** — the first public release: fast collection, the parallel
+> runner, `--warm` workers, the per-project daemon, and `--lf` / `--json` /
+> `--watch` / `--changed`. **`main` is v0.3**, which upgrades `--changed` to
+> AST-level impact analysis (the transitive import graph described below) and adds
+> the plugin compatibility matrix — build from source to use it.
+
+## Usage
+
+### Collecting tests
+
+```console
+$ cito collect                    # pytest-convention discovery, in parallel
+tests/test_api.py::test_get
+tests/test_api.py::TestAuth::test_login[admin]
+
+$ cito collect --count            # just the number
+$ cito collect --json             # grouped by file, for tools and agents
+$ cito collect -k "http and not slow"        # keyword filter at collection time
+$ cito collect --python .venv/bin/python     # env-aware: honors module-level importorskip
+```
+
+### Running tests
+
+```console
+$ cito run -n 8                   # parallel runner (subprocess workers)
+$ cito run -n 8 --warm            # workers stay warm across chunks
+$ cito run tests/test_api.py::TestAuth       # node-ID selectors, like pytest
+$ cito run -k "http and not slow" # keyword expressions
+$ cito run -m "not slow"          # mark expressions, filtered at collection time
+$ cito run -x                     # stop at first failure (--maxfail N)
+$ cito run --json                 # machine-readable summary for agents/CI
+$ cito run -- --cov=mypkg         # pass anything through to pytest; parallel
+                                  # coverage fragments are combined for you
+```
+
+### Running only what changed
+
+```console
+$ cito run --lf                   # only the tests that failed last time
+$ cito run --changed              # only tests a change can reach (AST import graph)
+$ cito run --watch --warm         # live loop: warm workers survive across saves
+```
+
+`--changed` runs only the tests a change can actually reach: a test file counts as
+impacted when it, a conftest above it, the config file, or **any project file it
+transitively imports** changed since the last run. Change one core module and exactly
+the tests that import it (directly or through other project modules) run; touch
+nothing and `cito run --changed` runs nothing. Resolution is AST-level and stays
+inside the project — third-party packages are treated as stable.
+
+### The warm daemon
+
+```console
+$ cito run --daemon               # hit the per-project warm daemon: one-shot
+                                  # runs in ~0.02s (auto-starts; unix)
+$ cito daemon status              # start | stop | status
+```
+
+`--warm` keeps pytest workers alive and runs chunks via `pytest.main()` in-process,
+so conftest, fixtures, and plugins keep working; the daemon extends that across CLI
+invocations. Execution always stays inside real CPython — cito partitions node IDs
+(whole files together, like `xdist --dist loadfile`) and hands them to pytest.
+
+## Compatibility
+
+pytest's node IDs are the interface, and cito treats them as a contract:
+
+1. A cito ID with a `[...]` suffix matches a pytest ID **exactly**.
+2. A bare cito ID stands for pytest's parametrized IDs of the same base — cito's
+   declared fallback wherever static analysis cannot be sure. A bare name is always a
+   valid pytest selector for all of its parametrizations.
+
+`scripts/diff_collect.py` enforces both directions on every commit — against fixture
+trees, a generated corpus, and **randomized differential fuzzing** (`bench/fuzz_gen.py`
+builds seeded projects mixing nested classes, cross-module inheritance, re-exports,
+parametrize variants, fixtures, marks, and shadowing; 100 seeds pass locally, three
+run in CI). Before releases, `scripts/validate_repos.py` reruns the whole matrix
+against fresh clones.
+
+**Differential results** — pytest IDs vs. cito, on a few of the largest and most
+hostile suites:
+
+| suite | pytest IDs | missing | wrong extras |
+|---|---:|---:|---:|
+| home-assistant 2026.7.1 (core + 249 integrations) | 81,251 | 0 | 0 |
+| botocore 1.43.40 | 78,668 | 0 | 0 |
+| packaging 26.2 | 61,513 | 0 | 0 |
+| pandas 3.0.3 | 197,077 | 26 (0.013%) | 2 |
+| pytest 9.1.1 (its own suite) | 4,231 | 1 (a `.txt` doctest) | 0 |
+
+Across 44 suites, ~716k node IDs are checked; the vast majority are exact.
+
+<details>
+<summary>Full differential matrix — 44 suites, including the honestly-partial cases</summary>
 
 | suite | pytest IDs | missing | wrong extras |
 |---|---:|---:|---:|
@@ -81,59 +201,14 @@ And the part that matters more than speed — **the same answers**:
 | aiohttp 3.14.1 | 4,364 | 0 | 0 |
 | hypothesis 6.156.1 | 3,647 | 0 | 3 (asyncio wrapper dynamics) |
 
-(`scripts/validate_repos.py` reruns the whole matrix against fresh clones —
-the release gate. sqlalchemy and django are documented out: their suites
-require project-specific collection-bootstrap plugins that no static tool
-can see.)
+(`scripts/validate_repos.py` reruns the whole matrix against fresh clones — the
+release gate. sqlalchemy and django are documented out: their suites require
+project-specific collection-bootstrap plugins that no static tool can see.)
 
-`scripts/diff_collect.py` computes this equivalence on every CI run.
+</details>
 
-## Why
-
-- pytest is the default test runner of the Python world (~a billion downloads
-  a month), and on large suites *collection alone* takes seconds to minutes
-  ([pytest#5516](https://github.com/pytest-dev/pytest/issues/5516)). Every
-  `pytest -k one_test` pays that tax before a single test runs.
-- The tax is no longer only human: coding agents run the suite dozens of times
-  per task. Suite latency is agent-loop latency.
-- Ruff and uv proved the recipe: reimplement the hot path in Rust, treat the
-  existing ecosystem's behavior as a compatibility contract, win by 10–100x.
-
-## Install
-
-Not on PyPI yet. From a checkout (builds with [maturin](https://maturin.rs)
-or plain cargo):
-
-```console
-$ uv tool install .          # or: pip install .
-$ cargo install --path .     # Rust toolchain route
-```
-
-## What works today
-
-```console
-$ cito collect                    # pytest-convention discovery, in parallel
-tests/test_api.py::test_get
-tests/test_api.py::TestAuth::test_login[admin]
-$ cito collect --count            # just the number
-$ cito collect --json             # grouped by file, for tools and agents
-$ cito collect --python .venv/bin/python   # env-aware: honors module-level importorskip
-$ cito run -n 8                   # parallel runner (subprocess workers)
-$ cito run -n 8 --warm            # v0.2 preview: pytest workers stay warm across chunks
-$ cito run tests/test_api.py::TestAuth     # node-ID selectors, like pytest
-$ cito run --lf                   # only the tests that failed last time
-$ cito run --watch --warm         # live loop: warm workers survive across saves
-$ cito run -k "http and not slow" # keyword expressions
-$ cito run -x                     # stop at first failure (--maxfail N)
-$ cito run --json                 # machine-readable summary for agents/CI
-$ cito run -- --cov=mypkg         # pass anything through to pytest; parallel
-                                  # coverage fragments are combined for you
-$ cito run -m "not slow"          # mark expressions, filtered at collection time
-$ cito run --changed              # only tests impacted by changes (AST import graph)
-$ cito run --daemon               # hit the per-project warm daemon: one-shot
-                                  # runs in ~0.02s (auto-starts; unix)
-$ cito daemon status              # start | stop | status
-```
+<details>
+<summary>What cito understands about collection, in detail</summary>
 
 - **Configuration discovery**: `pytest.ini`, `pyproject.toml` (`[tool.pytest]`
   and `[tool.pytest.ini_options]`), `tox.ini`, `setup.cfg`; rootdir inference;
@@ -151,79 +226,45 @@ $ cito daemon status              # start | stop | status
   disambiguation are expanded *exactly*. Anything static analysis cannot
   prove — floats, computed values, `indirect=`, parametrized or autouse
   fixtures, `pytest_generate_tests` in scope, unknown decorators — falls back
-  to the bare test name rather than risking a wrong ID. A bare name is always
-  a valid pytest selector for all of its parametrizations.
+  to the bare test name rather than risking a wrong ID.
 - **Environment awareness (opt-in)**: `--python PY` probes module-level
   `pytest.importorskip("...")` requirements and drops modules pytest would
   skip in that environment. Without it, collection is fully static.
-- **Runner preview**: `cito run` partitions node IDs (whole files together,
-  like `xdist --dist loadfile`) across N pytest subprocesses; `--warm` keeps
-  workers alive and runs chunks via `pytest.main()` in-process — execution
-  stays inside real CPython, so conftest, fixtures, and plugins keep working.
-  Corpus numbers: serial pytest 2.48 s → `cito run -n 8` 1.24 s → `--warm`
-  1.20 s.
-- **Scheduling**: failures are recorded in `.cito/lastfailed` (rootdir);
-  every run schedules previously-failed files first, then changed files,
-  then most-recently modified — the fastest possible time-to-first-signal.
-  `--lf` runs only the recorded failures (the cache clears as they pass).
-  `--watch` keeps running: save a test file and only that file reruns.
-- **Impact analysis** (`--changed`): runs only the tests a change can
-  actually reach — a test file counts as impacted when it, a conftest
-  above it, the config file, or **any project file it transitively
-  imports** changed since the last run. Change one core module and exactly
-  the tests that import it (directly or through other project modules)
-  run; touch nothing and `cito run --changed` runs nothing. Resolution is
-  AST-level and stays inside the project — third-party packages are
-  treated as stable.
-- **Node-ID selectors**: `cito run tests/a.py::TestX` and
-  `cito collect tests/a.py::test_y` restrict to matching tests, including
-  their parametrizations.
-- **Mark expressions**: `-m "not slow"` filters on statically-harvested
-  marks (function, class chain, and module `pytestmark`) *at collection
-  time* — deselected tests are never scheduled at all. `-m`/`-k` inside
-  config `addopts` are honored (CLI wins). Per-parametrize
-  `pytest.param(marks=...)` marks are not filtered (approximation).
+- **Scheduling**: failures are recorded in `.cito/lastfailed` (rootdir); every
+  run schedules previously-failed files first, then changed files, then
+  most-recently modified — the fastest possible time-to-first-signal. `--lf`
+  runs only the recorded failures (the cache clears as they pass).
+- **Mark expressions**: `-m "not slow"` filters on statically-harvested marks
+  (function, class chain, and module `pytestmark`) *at collection time* —
+  deselected tests are never scheduled. `-m`/`-k` inside config `addopts` are
+  honored (CLI wins). Per-parametrize `pytest.param(marks=...)` marks are not
+  filtered (approximation).
 - **Namespace collection**: test classes/functions *imported* into a test
   module are collected there too (the urllib3-contrib rerun pattern);
   `@pytest.fixture(name=...)` renames are tracked; anyio's plugin-injected
   backend parametrization is detected and falls back safely.
 
-## The compatibility contract
-
-pytest's node IDs are the interface:
-
-1. A cito ID with a `[...]` suffix must match a pytest ID **exactly**.
-2. A bare cito ID stands for pytest's parametrized IDs of the same base —
-   cito's declared fallback wherever static analysis cannot be sure.
-
-`scripts/diff_collect.py` enforces both directions on every commit against
-the fixture trees, a generated corpus, and **randomized differential fuzzing**
-(`bench/fuzz_gen.py` builds seeded projects mixing nested classes,
-cross-module inheritance, re-exports, parametrize variants, fixtures, marks,
-and shadowing; 100 seeds pass locally, three run in CI). ~40 real
-repositories — from flask to pandas to home-assistant — are checked before
-releases via `scripts/validate_repos.py`.
+</details>
 
 Known gaps, tracked honestly:
 
 - doctest collection (`--doctest-modules`, `.txt` doctests)
 - exact expansion where parametrization is computed at runtime (falls back to
   bare names by design; ~4% of IDs in heavily-fixtured repos like pandas),
-  including pytest's duplicate-ID suffixes (True0/True1), which always
-  fall back
+  including pytest's duplicate-ID suffixes (True0/True1), which always fall back
 - `pytest_generate_tests`-generated *extra* tests that add new names
 - import-time class factories that synthesize tests from data files
   (jsonschema builds ~7k tests from the JSON-Schema-Test-Suite this way)
 - plugin-driven collection hooks and custom collectors (literal
-  `collect_ignore` / `collect_ignore_glob` lists in conftest.py ARE
-  supported; computed appends are not), and plugins that redefine
-  collection semantics outright (pytest-relaxed)
+  `collect_ignore` / `collect_ignore_glob` lists in conftest.py ARE supported;
+  computed appends are not), and plugins that redefine collection semantics
+  outright (pytest-relaxed)
 
-## Plugin compatibility
+### Plugins
 
-Plugins run untouched at execution time — cito hands pytest real node IDs
-and pytest loads your plugins as always. What matters for cito is whether a
-plugin changes *collection*; this matrix is the current, tested state:
+Plugins run untouched at execution time — cito hands pytest real node IDs and pytest
+loads your plugins as always. What matters for cito is whether a plugin changes
+*collection*; this matrix is the current, tested state:
 
 | plugin | collection-time behavior | status | evidence |
 |---|---|---|---|
@@ -243,33 +284,93 @@ plugin changes *collection*; this matrix is the current, tested state:
 | ipython ipdoctest, doctest plugins | **collect non-test sources** | not supported (doctest is a known gap) | ipython, dateutil |
 | custom `pytest_collect_file` collectors | **turn arbitrary files into tests** | not supported by design | pygments, sqlalchemy/django bootstrap plugins |
 
-## Architecture
+## Benchmarks
 
-1. **v0.1 — collection parity + speed**: shipped.
-2. **v0.2 — warm workers**: shipped — `--warm` pools within a run, `--watch`
-   keeps them across saves, and `cito run --daemon` keeps them across CLI
-   invocations (workers self-purge modules whose files changed).
-3. **v0.3 — scheduling**: shipped — failed-first, `--lf`, `--json`, and
-   AST-level impact analysis (`--changed` follows the project import graph,
-   conftest chain, and config).
-4. **Plugin compatibility matrix**: shipped — see
-   [Plugin compatibility](#plugin-compatibility); each row is backed by a
-   differential-validated repository.
+Collection, wall time (Apple M4 Max, Python 3.14, warm cache; see
+[BENCHMARKS.md](BENCHMARKS.md) to reproduce, including the execution/runner numbers):
 
-## Non-goals
+| suite | tests | `pytest --collect-only -q` | `cito collect` | speedup |
+|---|---:|---:|---:|---:|
+| home-assistant 2026.7.1 (validated scope) | 81,251 | 16.91 s | **0.11 s** | 156× |
+| pandas 3.0.3 (installed) | 197,077 | 9.48 s | **0.26 s** | 36× |
+| pytest 9.1.1 (own suite) | 4,231 | 0.62 s | **&lt;0.01 s** | &gt;100× |
+| synthetic corpus | 11,000 | 0.70 s | **0.01 s** | 70× |
 
-- Replacing pytest's test-writing API. Your tests, fixtures, and plugins are
-  the point; cito's job is to run them faster.
-- A new assertion or fixture DSL.
+`scripts/diff_collect.py` computes the collection equivalence on every CI run, so the
+speed above always comes with the same answers.
 
-## Development
+## Roadmap
+
+cito ships in phases, each gated on differential parity:
+
+1. **v0.1 — collection parity + speed** — shipped.
+2. **v0.2 — warm workers** — shipped: `--warm` pools within a run, `--watch` keeps
+   them across saves, and `cito run --daemon` keeps them across CLI invocations
+   (workers self-purge modules whose files changed).
+3. **v0.3 — scheduling & impact analysis** — shipped on `main`: failed-first
+   ordering, `--lf`, `--json`, and AST-level `--changed` (follows the project import
+   graph, conftest chain, and config).
+4. **Plugin compatibility matrix** — shipped — see [Compatibility](#compatibility);
+   each row is backed by a differential-validated repository.
+5. **Toward 1.0** — freeze the CLI surface and the node-ID contract.
+
+## Contributing
+
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the test
+pyramid, and how to report a collection mismatch (the most valuable bug report for a
+compatibility tool). The short version:
 
 ```console
-$ cargo test                                   # unit + integration tests
-$ cargo build --release
+$ cargo test                                   # unit + fixture-tree integration tests
+$ cargo fmt && cargo clippy --release --all-targets
 $ uv run --with pytest scripts/diff_collect.py tests/fixtures/basic
-$ bench/bench_collect.sh                       # reproduce the corpus numbers
 ```
+
+CI blocks on Linux, macOS, and Windows plus a pytest node-ID parity job. If you change
+collection behavior, name the fixture tree or validated repository that covers it —
+and if none does, add a fixture.
+
+## FAQ
+
+**How do you pronounce cito?** "KEE-toh" — Latin for "quickly," the word doctors still
+write on prescriptions and orders to mean *urgently*. Say it however you like.
+
+**Is cito a replacement for pytest?** No — and that's a non-goal. cito doesn't execute
+your tests itself, and it adds no new assertion or fixture DSL; pytest does the
+running. cito makes the inner loop fast — collection, selection, scheduling, warm
+workers — and hands pytest the exact node IDs to run. Your tests, fixtures, and
+plugins are the point.
+
+**Which Python and pytest versions does it support?** Any Python ≥3.9 with your
+existing pytest; node-ID parity is validated against pytest 8.x and 9.x (a few repos
+are pinned per their own constraints). Static collection never imports your code;
+opt-in `--python` probing uses whatever interpreter you point it at.
+
+**Why is it so much faster?** Collection never starts a Python interpreter, imports
+your modules, or loads plugins and conftest — the three costs that dominate
+`pytest --collect-only`. cito parses the source with Ruff's parser and resolves
+pytest's collection semantics statically, in parallel, in Rust.
+
+**Is it ready for production?** Collection is the mature part: differentially tested
+against 44 real suites (~716k node IDs) plus randomized fuzzing, with node-ID parity
+enforced in CI on every commit. The runner is a preview — it drives real pytest
+subprocesses, so your fixtures, conftest, and plugins run exactly as before, but its
+CLI is younger. cito is pre-1.0: `0.x` minor versions may change behavior where pytest
+compatibility requires it (patches are fixes only); **1.0 will freeze the CLI and the
+node-ID contract.**
+
+**Does it work on Windows, macOS, and Linux?** Yes — CI blocks on all three. The warm
+daemon is unix-only for now; everything else is cross-platform.
+
+## Acknowledgements
+
+- [Ruff](https://github.com/astral-sh/ruff) — cito parses every test file with its
+  `ruff_python_parser` and `ruff_python_ast` crates, and Ruff (with
+  [uv](https://github.com/astral-sh/uv)) is the proof that reimplementing a hot path
+  in Rust while keeping the ecosystem's contract is a recipe worth following.
+- [pytest](https://github.com/pytest-dev/pytest) — the behavior cito treats as a
+  contract and differentially tests against on every commit. cito is a faster front
+  door to pytest, not a fork of it.
 
 ## License
 
