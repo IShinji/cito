@@ -59,11 +59,8 @@ $ uv tool install .          # or: pip install .
 $ cargo install --path .     # Rust-toolchain route
 ```
 
-> **PyPI has v0.2.0** — the first public release: fast collection, the parallel
-> runner, `--warm` workers, the per-project daemon, and `--lf` / `--json` /
-> `--watch` / `--changed`. **`main` is v0.3**, which upgrades `--changed` to
-> AST-level impact analysis (the transitive import graph described below) and adds
-> the plugin compatibility matrix — build from source to use it.
+> The current release is **v0.3.0** — see the [CHANGELOG](CHANGELOG.md) for
+> what's new in each release.
 
 ## Usage
 
@@ -307,9 +304,9 @@ cito ships in phases, each gated on differential parity:
 2. **v0.2 — warm workers** — shipped: `--warm` pools within a run, `--watch` keeps
    them across saves, and `cito run --daemon` keeps them across CLI invocations
    (workers self-purge modules whose files changed).
-3. **v0.3 — scheduling & impact analysis** — shipped on `main`: failed-first
-   ordering, `--lf`, `--json`, and AST-level `--changed` (follows the project import
-   graph, conftest chain, and config).
+3. **v0.3 — scheduling & impact analysis** — shipped: failed-first ordering,
+   `--lf`, `--json`, and AST-level `--changed` (follows the project import graph,
+   conftest chain, and config).
 4. **Plugin compatibility matrix** — shipped — see [Compatibility](#compatibility);
    each row is backed by a differential-validated repository.
 5. **Toward 1.0** — freeze the CLI surface and the node-ID contract.

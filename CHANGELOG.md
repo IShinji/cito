@@ -5,7 +5,7 @@ output where pytest compatibility requires it; patch versions are fixes
 only. 1.0 will freeze the CLI surface and the node-ID compatibility
 contract documented in the README.
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-07-13)
 
 - `--changed` is now AST-level impact analysis: a test file runs when it,
   a conftest above it, the config file, or any project file it
