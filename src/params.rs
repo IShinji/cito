@@ -433,20 +433,61 @@ fn render_scalar(expr: &Expr) -> Option<String> {
     match expr {
         Expr::StringLiteral(s) => safe_string(s.value.to_str()),
         Expr::NumberLiteral(n) => match &n.value {
-            ast::Number::Int(i) => Some(i.to_string()),
+            ast::Number::Int(i) => int_decimal(i),
             _ => None,
         },
         Expr::BooleanLiteral(b) => Some(if b.value { "True" } else { "False" }.to_string()),
         Expr::NoneLiteral(_) => Some("None".to_string()),
         Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOp::USub) => match &*u.operand {
             Expr::NumberLiteral(n) => match &n.value {
-                ast::Number::Int(i) => Some(format!("-{i}")),
+                // `-0` is just the int 0.
+                ast::Number::Int(i) => {
+                    int_decimal(i).map(|d| if d == "0" { d } else { format!("-{d}") })
+                }
                 _ => None,
             },
             _ => None,
         },
         _ => None,
     }
+}
+
+/// An int literal's decimal value (pytest renders `str(value)`). Literals
+/// beyond u64 keep their source token (`0xFFFF_...`), so non-decimal ones
+/// are converted with arbitrary precision.
+fn int_decimal(value: &ast::Int) -> Option<String> {
+    let text = value.to_string().replace('_', "");
+    let lower = text.to_ascii_lowercase();
+    let (radix, digits) = match lower.get(..2) {
+        Some("0x") => (16, &lower[2..]),
+        Some("0o") => (8, &lower[2..]),
+        Some("0b") => (2, &lower[2..]),
+        _ => return Some(text),
+    };
+    radix_to_decimal(digits, radix)
+}
+
+/// Arbitrary-precision base conversion: little-endian limbs of 10^9.
+fn radix_to_decimal(digits: &str, radix: u32) -> Option<String> {
+    const LIMB: u64 = 1_000_000_000;
+    let mut limbs: Vec<u64> = vec![0];
+    for c in digits.chars() {
+        let mut carry = u64::from(c.to_digit(radix)?);
+        for limb in limbs.iter_mut() {
+            let v = *limb * u64::from(radix) + carry;
+            *limb = v % LIMB;
+            carry = v / LIMB;
+        }
+        while carry > 0 {
+            limbs.push(carry % LIMB);
+            carry /= LIMB;
+        }
+    }
+    let mut out = limbs.last().expect("non-empty").to_string();
+    for limb in limbs.iter().rev().skip(1) {
+        out.push_str(&format!("{limb:09}"));
+    }
+    Some(out)
 }
 
 /// pytest escapes non-ascii and unprintable characters in string IDs; rather
@@ -456,4 +497,20 @@ fn safe_string(s: &str) -> Option<String> {
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '=')))
     .then(|| s.to_string())
+}
+
+#[cfg(test)]
+mod int_tests {
+    use super::radix_to_decimal;
+
+    #[test]
+    fn big_radix_literals() {
+        assert_eq!(
+            radix_to_decimal("ffffffffffffffffffff", 16).as_deref(),
+            Some("1208925819614629174706175")
+        );
+        assert_eq!(radix_to_decimal("0", 16).as_deref(), Some("0"));
+        assert_eq!(radix_to_decimal("777", 8).as_deref(), Some("511"));
+        assert_eq!(radix_to_decimal("12", 2), None);
+    }
 }
