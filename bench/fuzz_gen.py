@@ -11,6 +11,8 @@ Pair with scripts/diff_collect.py to compare answers.
 import argparse
 import pathlib
 import random
+import shutil
+import sys
 
 SAFE_STRS = ["red", "blue", "a-b", "x.y", "v_1"]
 MARKS = ["slow", "network", "smoke"]
@@ -186,16 +188,31 @@ class Gen:
         return "\n".join(lines) + "\n"
 
 
+def prepare_out(out: pathlib.Path, force: bool) -> None:
+    """Create an empty output dir; leftovers from a previous run would
+    silently inflate the corpus, so a non-empty dir needs --force."""
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        if not force:
+            sys.exit(f"{out} exists and is not empty; pass --force to replace it")
+        if not out.is_dir() or (out / ".git").exists():
+            sys.exit(f"refusing to remove {out}: not a generated corpus")
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--files", type=int, default=6)
     parser.add_argument("--out", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--force", action="store_true", help="remove a non-empty --out first"
+    )
     args = parser.parse_args()
 
     gen = Gen(args.seed)
     out = args.out
-    out.mkdir(parents=True, exist_ok=True)
+    prepare_out(out, args.force)
 
     (out / "pytest.ini").write_text(
         "[pytest]\nmarkers =\n    slow: s\n    network: n\n    smoke: k\n"

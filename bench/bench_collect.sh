@@ -8,7 +8,7 @@ files="${FILES:-500}"
 tests="${TESTS:-20}"
 
 cargo build --release --manifest-path "$repo/Cargo.toml"
-python3 "$repo/bench/gen_corpus.py" --files "$files" --tests "$tests" --out "$corpus"
+python3 "$repo/bench/gen_corpus.py" --files "$files" --tests "$tests" --out "$corpus" --force
 
 pytest_cmd=(python3 -m pytest)
 if ! python3 -c "import pytest" 2>/dev/null; then

@@ -3,7 +3,8 @@
 real-world repositories, cloned at the tag matching the installed wheel.
 
 Usage:
-    python3 scripts/validate_repos.py --python VENV/bin/python --cache DIR [--only pkg,pkg]
+    python3 scripts/validate_repos.py --python VENV/bin/python --cache DIR \
+        [--python9 VENV9/bin/python] [--only pkg,pkg]
 
 The venv must have the packages (and their test dependencies) installed.
 Prints one summary line per repo and exits nonzero if any repo regresses.
@@ -38,7 +39,8 @@ MATRIX = [
     ("black", "https://github.com/psf/black", ["{v}", "v{v}"], [], [], 0),
     ("pydantic", "https://github.com/pydantic/pydantic", ["v{v}", "{v}"], [], [], 0),
     ("fastapi", "https://github.com/fastapi/fastapi", ["{v}", "v{v}"], [], [], 0),
-    ("sympy", "https://github.com/sympy/sympy", ["sympy-{v}", "{v}"], [], [], 20),
+    # sympy: 16 extras (README) = custom @SKIP import-time machinery.
+    ("sympy", "https://github.com/sympy/sympy", ["sympy-{v}", "{v}"], [], [], 16),
     ("pillow", "https://github.com/python-pillow/Pillow", ["{v}", "v{v}"], [], [], 0),
     # hypothesis: 3 extras = unittest generator-method dynamics in its own
     # asyncio wrappers.
@@ -79,10 +81,8 @@ MATRIX = [
     # its doctest modules; plugin is required by pydantic), setuptools (its
     # own tests/compat/py39.py imports a removed stdlib helper on 3.14).
     ("pip", "https://github.com/pypa/pip", ["{v}", "v{v}"], [], [], 0),
-    # aiohttp: ~19 extras = marks applied dynamically by conftest hooks
-    # (pytest_collection_modifyitems tagging whole directories) interacting
-    # with addopts -m deselection.
-    ("aiohttp", "https://github.com/aio-libs/aiohttp", ["v{v}", "{v}"], [], [], 20),
+    # aiohttp: exact (README: 0 missing, 0 extras) — no tolerance.
+    ("aiohttp", "https://github.com/aio-libs/aiohttp", ["v{v}", "{v}"], [], [], 0),
     # Documented out of the matrix (not collection-semantics issues):
     # - pygments: custom pytest_collect_file collectors turn example files
     #   (.pmod, ...) into test items
@@ -90,7 +90,6 @@ MATRIX = [
     #   pyiceberg, moto[server], ...) — needs the full dev environment
     # - psutil: repo source tree shadows the compiled wheel; suite must run
     #   against an installed build
-    # - hypothesis: monorepo-subproject rootdir nuance under investigation
     # Skipped by design (documented): sqlalchemy and django test suites
     # require their own collection-bootstrap plugins; pytest itself collects
     # nothing without them.
@@ -143,9 +142,14 @@ def main() -> int:
     for entry in MATRIX:
         package, url, templates, extra, ignore, max_extra = entry[:6]
         needs = entry[6] if len(entry) > 6 else ""
-        python = args.python9 if needs == "9" and args.python9 else args.python
         if only and package not in only:
             continue
+        if needs == "9" and not args.python9:
+            # Validating against pytest 8 would false-FAIL (e.g. coverage's
+            # native [tool.pytest] table is ignored before pytest 9).
+            print(f"{package:12s} SKIP (needs a pytest-9 venv; pass --python9)")
+            continue
+        python = args.python9 if needs == "9" else args.python
         probe = sh(
             [
                 python,
@@ -190,6 +194,8 @@ def main() -> int:
         if status == "FAIL":
             for line in result.stdout.strip().splitlines()[:6]:
                 print(f"    {line}")
+            for line in result.stderr.strip().splitlines()[-10:]:
+                print(f"    stderr: {line}")
     return 1 if failures else 0
 
 

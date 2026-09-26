@@ -3,6 +3,8 @@
 
 import argparse
 import pathlib
+import shutil
+import sys
 
 FUNC = '''
 
@@ -21,6 +23,18 @@ class TestBox{i:04d}:
 '''
 
 
+def prepare_out(out: pathlib.Path, force: bool) -> None:
+    """Create an empty output dir; leftovers from a previous run would
+    silently inflate the corpus, so a non-empty dir needs --force."""
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        if not force:
+            sys.exit(f"{out} exists and is not empty; pass --force to replace it")
+        if not out.is_dir() or (out / ".git").exists():
+            sys.exit(f"refusing to remove {out}: not a generated corpus")
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--files", type=int, default=500)
@@ -28,9 +42,12 @@ def main() -> None:
         "--tests", type=int, default=20, help="module-level tests per file"
     )
     parser.add_argument("--out", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--force", action="store_true", help="remove a non-empty --out first"
+    )
     args = parser.parse_args()
 
-    args.out.mkdir(parents=True, exist_ok=True)
+    prepare_out(args.out, args.force)
     (args.out / "conftest.py").write_text("# generated corpus\n")
     for i in range(args.files):
         parts = [f'"""Generated module {i}."""']

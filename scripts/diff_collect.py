@@ -14,6 +14,7 @@ Anything else is a failure in either direction.
 """
 
 import argparse
+import os
 import pathlib
 import re
 import subprocess
@@ -85,10 +86,11 @@ def main() -> int:
     args = parser.parse_args()
 
     repo = pathlib.Path(__file__).resolve().parent.parent
+    exe = "cito.exe" if os.name == "nt" else "cito"
     binary = args.cito or next(
         (
             str(p)
-            for p in (repo / "target/release/cito", repo / "target/debug/cito")
+            for p in (repo / "target/release" / exe, repo / "target/debug" / exe)
             if p.exists()
         ),
         None,
