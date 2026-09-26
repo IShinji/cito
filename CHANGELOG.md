@@ -5,6 +5,54 @@ output where pytest compatibility requires it; patch versions are fixes
 only. 1.0 will freeze the CLI surface and the node-ID compatibility
 contract documented in the README.
 
+## Unreleased
+
+Fixes from a full review against pytest 9.0.3; every item has a
+regression test or fixture.
+
+- **Runner correctness.** `--changed` no longer forgets failing tests or
+  files it never ran (filtered by `-k`/`--lf`, cut off by `--maxfail`) —
+  only files whose tests all ran and passed record their hashes. `--lf`
+  matches node IDs exactly on path boundaries, and file-level collection
+  errors now rerun. A collection error in one file no longer aborts the
+  rest of its chunk. Exit codes combine pytest's 2/3/4/5 by severity
+  instead of collapsing to 1; `--json` output carries `exit_code`.
+- **Warm workers and daemon.** Workers evict every project module when any
+  project file changes (dependents no longer keep stale bindings); the
+  worker protocol runs on private fds, so tests writing to fd 1 under `-s`
+  can't corrupt it. The daemon keys workers on the client's env and cwd,
+  serves each connection on its own thread with timeouts, allows a single
+  server per rootdir (lock file), and lives in a private per-user
+  directory (`$XDG_RUNTIME_DIR/cito` or `$TMPDIR/cito-<uid>`, mode 0700,
+  socket 0600). `--watch` reruns tests affected by helper, conftest, and
+  config changes, not only edited test files.
+- **Collection parity.** `__test__ = False`/`True`; inherited `__init__`
+  skips a class; `collect_ignore` directory entries; statically dead
+  `elif`/`else` arms; nested classes (inherited ones collected, ones inside
+  `TestCase` not); data-valued class attributes are not tests; `del` then
+  redefine; defs inside top-level `with`. Order now matches pytest: a
+  redefined name keeps its first slot, imported tests sit at the import,
+  nested classes interleave in source order, class members follow the C3
+  MRO base-first, and unittest methods sort by name.
+- **Configuration.** Patterns use Python fnmatch semantics (the default
+  `{arch}` no longer skips directories named `arch`; patterns with `/`
+  match at any depth). Ini files parse like iniconfig (comments after
+  section headers, `key: value`), args-type options split with shlex, and
+  malformed or conflicting configs error like pytest instead of being
+  ignored. `addopts` honors attached `-kfoo`/`-mslow` and `--ignore`.
+- **`-k`** matches pytest's keyword set — parent directories, file,
+  class, marker names — and no longer matches across `::`; empty `-k`/`-m`
+  mean no filter.
+- **Param IDs.** Large hex/octal/binary ints render in decimal; `-0`
+  renders as `0`.
+- **Windows.** `cito run --python` defaults to `python` (not `python3`).
+- **Packaging and CI.** Build requires maturin ≥ 1.9 (sdist builds failed
+  on 1.5–1.8). Releases are gated on the full CI suite, add musllinux
+  x86_64/aarch64 and Windows arm64 wheels, smoke-test installed wheels,
+  and create a GitHub Release; actions are pinned to SHAs. CI runs clippy
+  `-D warnings` on all platforms, an MSRV (1.94) job, and pytest parity
+  against both 8.4.2 and 9.x.
+
 ## 0.3.0 (2026-07-13)
 
 - `--changed` is now AST-level impact analysis: a test file runs when it,
