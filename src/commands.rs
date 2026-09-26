@@ -590,25 +590,31 @@ fn run_once(
         "cito: running {total} tests across {} {mode} workers",
         options.workers
     );
-    let outcome = 'exec: {
-        #[cfg(unix)]
-        if options.daemon {
-            if let Some(outcome) = crate::daemon::run(
-                &config.rootdir,
-                &files,
-                &options.python,
-                options.workers,
-                options.chunk,
-                options.maxfail,
-                &options.extra_args,
-                &options.coverage_base,
-                &cwd,
-            ) {
-                break 'exec outcome;
-            }
+    #[cfg(unix)]
+    let daemon_outcome = if options.daemon {
+        let outcome = crate::daemon::run(
+            &config.rootdir,
+            &files,
+            &options.python,
+            options.workers,
+            options.chunk,
+            options.maxfail,
+            &options.extra_args,
+            &options.coverage_base,
+            &cwd,
+        );
+        if outcome.is_none() {
             eprintln!("cito: daemon unreachable; falling back to local workers");
         }
-        match pool {
+        outcome
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let daemon_outcome = None;
+    let outcome = match daemon_outcome {
+        Some(outcome) => outcome,
+        None => match pool {
             Some(pool) => pool.run(
                 files,
                 options.chunk,
@@ -628,7 +634,7 @@ fn run_once(
                 Some(&options.coverage_base),
                 &cwd,
             ),
-        }
+        },
     };
     let mut outcome = outcome;
     // pytest prints IDs relative to its working directory; the caches and
@@ -1033,6 +1039,7 @@ fn watch_loop(
     }
 }
 
+#[cfg(unix)]
 fn daemon_rootdir() -> Config {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     Config::discover(&cwd)
