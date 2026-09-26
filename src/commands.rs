@@ -69,19 +69,42 @@ fn apply_selectors(files: &mut [collector::FileTests], selectors: &[Selector]) {
     }
 }
 
-/// `-k` filtering against `basename::testid`, pytest-style approximation.
+/// pytest's `KeywordMatcher.from_item` name set for one test: every node
+/// name up the chain except the Session and the rootdir Directory (so each
+/// rootdir-relative directory, the file basename, each class, and the item
+/// name with its parameter suffix), plus the test's marker names and the
+/// `pytestmark` attribute of directly-marked functions. Lowercased.
+fn keyword_names(file: &collector::FileTests, test: &str) -> Vec<String> {
+    let mut names: Vec<String> = file
+        .path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let (base, params) = match test.find('[') {
+        Some(i) => test.split_at(i),
+        None => (test, ""),
+    };
+    let mut parts: Vec<&str> = base.split("::").collect();
+    let item = parts.pop().unwrap_or_default();
+    names.extend(parts.iter().map(|p| p.to_lowercase()));
+    names.push(format!("{item}{params}").to_lowercase());
+    if let Some(words) = file.keywords.get(base) {
+        names.extend(words.iter().map(|w| w.to_lowercase()));
+    }
+    names
+}
+
+/// `-k` filtering: each fragment must be a substring of one keyword name.
 fn apply_keyword(files: &mut [collector::FileTests], expr: &keyword::KExpr) {
     for file in files.iter_mut() {
-        let basename = file
-            .path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&file.path)
-            .to_string();
-        file.tests.retain(|t| {
-            let candidate = format!("{basename}::{t}").to_lowercase();
-            expr.matches(&candidate)
-        });
+        let keep: Vec<bool> = file
+            .tests
+            .iter()
+            .map(|t| expr.matches(&keyword_names(file, t)))
+            .collect();
+        let mut keep = keep.into_iter();
+        file.tests.retain(|_| keep.next().unwrap_or(false));
     }
 }
 
@@ -147,13 +170,25 @@ fn collect_files(
     let (root_args, selectors) = parse_selections(paths, &cwd);
     let arg_dirs = dirs_from_args(&root_args, &cwd);
     let config = Config::discover_for(&cwd, &arg_dirs);
+    if let Some(err) = &config.error {
+        return Err(err.clone());
+    }
     let marker = marker_cli
         .or_else(|| config.addopts_flag("-m"))
-        .map(|m| keyword::parse(&m).map_err(|e| format!("invalid -m expression: {e}")))
-        .transpose()?;
+        .map(|m| keyword::parse_marker_option(&m))
+        .transpose()
+        .map_err(|e| format!("invalid -m expression: {e}"))?
+        .flatten();
     let roots = resolve_roots(root_args, &config, &cwd);
+    // addopts `--ignore` entries apply alongside the CLI ones.
+    let addopts_ignore: Vec<PathBuf> = config
+        .addopts_values("--ignore")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
     let ignored: Vec<PathBuf> = ignore
         .iter()
+        .chain(addopts_ignore.iter())
         .map(|p| {
             let abs = if p.is_absolute() {
                 p.clone()
@@ -349,9 +384,9 @@ pub fn collect(
     };
     let kexpr = kexpr
         .or_else(|| config.addopts_flag("-k"))
-        .map(|k| keyword::parse(&k));
+        .map(|k| keyword::parse_keyword_option(&k));
     let kexpr = match kexpr.transpose() {
-        Ok(expr) => expr,
+        Ok(expr) => expr.flatten(),
         Err(err) => {
             eprintln!("cito: invalid -k expression: {err}");
             return ExitCode::FAILURE;
@@ -608,9 +643,9 @@ pub fn run(
     };
     let kexpr = kexpr
         .or_else(|| config.addopts_flag("-k"))
-        .map(|k| keyword::parse(&k));
+        .map(|k| keyword::parse_keyword_option(&k));
     let kexpr = match kexpr.transpose() {
-        Ok(expr) => expr,
+        Ok(expr) => expr.flatten(),
         Err(err) => {
             eprintln!("cito: invalid -k expression: {err}");
             return ExitCode::FAILURE;

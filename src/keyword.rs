@@ -1,8 +1,8 @@
-//! pytest-style `-k` keyword expressions: fragments combined with `and`,
-//! `or`, `not`, and parentheses. A fragment matches if it is a
-//! case-insensitive substring of the candidate (file basename + node ID —
-//! an approximation of pytest's keyword set that covers names, classes,
-//! files, and parametrize IDs).
+//! pytest-style `-k` / `-m` expressions: fragments combined with `and`,
+//! `or`, `not`, and parentheses. For `-k` a fragment matches if it is a
+//! case-insensitive substring of any name in the item's keyword set
+//! (pytest's `KeywordMatcher`: node names up the chain, marker names, ...);
+//! for `-m` it must be one of the item's marker names.
 
 #[derive(Debug, PartialEq)]
 pub enum KExpr {
@@ -10,17 +10,24 @@ pub enum KExpr {
     And(Box<KExpr>, Box<KExpr>),
     Not(Box<KExpr>),
     Frag(String),
+    /// The empty expression, which pytest evaluates to False.
+    Empty,
 }
 
 impl KExpr {
-    /// `-k` semantics: case-insensitive substring. `candidate` must already
-    /// be lowercased.
-    pub fn matches(&self, candidate: &str) -> bool {
+    /// `-k` semantics: a fragment is a case-insensitive substring of any
+    /// one name (so `a::b` never spans two names). `names` must already be
+    /// lowercased.
+    pub fn matches(&self, names: &[String]) -> bool {
         match self {
-            KExpr::Or(a, b) => a.matches(candidate) || b.matches(candidate),
-            KExpr::And(a, b) => a.matches(candidate) && b.matches(candidate),
-            KExpr::Not(inner) => !inner.matches(candidate),
-            KExpr::Frag(frag) => candidate.contains(frag.to_lowercase().as_str()),
+            KExpr::Or(a, b) => a.matches(names) || b.matches(names),
+            KExpr::And(a, b) => a.matches(names) && b.matches(names),
+            KExpr::Not(inner) => !inner.matches(names),
+            KExpr::Frag(frag) => {
+                let frag = frag.to_lowercase();
+                names.iter().any(|name| name.contains(frag.as_str()))
+            }
+            KExpr::Empty => false,
         }
     }
 
@@ -31,6 +38,7 @@ impl KExpr {
             KExpr::And(a, b) => a.matches_names(names) && b.matches_names(names),
             KExpr::Not(inner) => !inner.matches_names(names),
             KExpr::Frag(frag) => names.contains(frag.as_str()),
+            KExpr::Empty => false,
         }
     }
 }
@@ -128,6 +136,9 @@ pub fn parse(input: &str) -> Result<KExpr, String> {
         tokens: tokenize(input),
         pos: 0,
     };
+    if parser.tokens.is_empty() {
+        return Ok(KExpr::Empty);
+    }
     let expr = parser.expr()?;
     if parser.pos != parser.tokens.len() {
         return Err(format!(
@@ -138,12 +149,33 @@ pub fn parse(input: &str) -> Result<KExpr, String> {
     Ok(expr)
 }
 
+/// A `-k` option value: pytest strips leading whitespace and treats an
+/// empty result as "no keyword filter".
+pub fn parse_keyword_option(value: &str) -> Result<Option<KExpr>, String> {
+    let value = value.trim_start();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse(value).map(Some)
+}
+
+/// A `-m` option value: only the empty string disables the filter; a
+/// whitespace-only expression is the empty expression, which is False and
+/// deselects everything (pytest 9 behavior).
+pub fn parse_marker_option(value: &str) -> Result<Option<KExpr>, String> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse(value).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn m(expr: &str, candidate: &str) -> bool {
-        parse(expr).unwrap().matches(&candidate.to_lowercase())
+        let names: Vec<String> = candidate.split("::").map(|n| n.to_lowercase()).collect();
+        parse(expr).unwrap().matches(&names)
     }
 
     #[test]
@@ -155,6 +187,17 @@ mod tests {
         assert!(m("grpc or http", "test_api.py::TestHttp::test_get"));
         assert!(m("not (grpc or ftp)", "test_api.py::TestHttp::test_get"));
         assert!(m("TESTHTTP", "test_api.py::testhttp::test_get"));
+        // A fragment never spans two names.
+        assert!(!m("py::TestHttp", "test_api.py::TestHttp::test_get"));
+    }
+
+    #[test]
+    fn empty_options() {
+        assert_eq!(parse_keyword_option("").unwrap(), None);
+        assert_eq!(parse_keyword_option("  ").unwrap(), None);
+        assert_eq!(parse_marker_option("").unwrap(), None);
+        let blank = parse_marker_option(" ").unwrap().unwrap();
+        assert!(!blank.matches_names(&["slow".to_string()].into()));
     }
 
     #[test]
@@ -172,6 +215,6 @@ mod tests {
         assert!(parse("and http").is_err());
         assert!(parse("(http").is_err());
         assert!(parse("http)").is_err());
-        assert!(parse("").is_err());
+        assert_eq!(parse("").unwrap(), KExpr::Empty);
     }
 }

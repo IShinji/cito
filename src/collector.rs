@@ -17,6 +17,10 @@ pub struct FileTests {
     /// Absolute path, used to build node IDs that pytest can run from any cwd.
     pub abs_path: PathBuf,
     pub tests: Vec<String>,
+    /// `-k` keyword names per test (marks, `pytestmark`), keyed by the
+    /// unparametrized test ID (`Class::test`).
+    #[serde(skip)]
+    pub keywords: HashMap<String, Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,6 +1303,8 @@ struct Resolver<'a> {
     /// into site-packages (e.g. external TestCase base classes). Lazy.
     sys_paths: Option<Vec<PathBuf>>,
     mro_cache: HashMap<ClassKey, (Vec<MroClass>, bool)>,
+    /// Keyword names of the tests emitted for the current module.
+    keywords: HashMap<String, Vec<String>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -1310,7 +1316,29 @@ impl<'a> Resolver<'a> {
             probe_cache: HashMap::new(),
             sys_paths: None,
             mro_cache: HashMap::new(),
+            keywords: HashMap::new(),
         }
+    }
+
+    /// Record a test's `-k` names: its marks, plus the `pytestmark`
+    /// attribute that a directly-marked function carries in its __dict__.
+    fn note_keywords(
+        &mut self,
+        module: &Rc<Module>,
+        key: String,
+        names: &HashSet<String>,
+        def: &TestDef,
+    ) {
+        let mut words: Vec<String> = names.iter().cloned().collect();
+        let direct = !def.marks.is_empty()
+            || def
+                .maybe_marks
+                .iter()
+                .any(|c| self.resolve_mark_alias(module, c).is_some());
+        if direct {
+            words.push("pytestmark".to_string());
+        }
+        self.keywords.insert(key, words);
     }
 
     fn sys_paths(&mut self) -> Vec<PathBuf> {
@@ -1910,6 +1938,7 @@ pub fn collect(
                 path: display_path(abs, &config.rootdir),
                 abs_path: abs.clone(),
                 tests,
+                keywords: std::mem::take(&mut resolver.keywords),
             }
         })
         .collect()
@@ -2203,7 +2232,11 @@ fn emit_module(
                         continue;
                     }
                 }
-                tests.push(format!("{name}::runTest"));
+                let key = format!("{name}::runTest");
+                resolver
+                    .keywords
+                    .insert(key.clone(), module.pytestmark.clone());
+                tests.push(key);
             }
             // pytest collects over the module NAMESPACE: test classes and
             // functions *imported* into a test module are collected here
@@ -2329,6 +2362,7 @@ fn emit_function_with(
             return;
         }
     }
+    resolver.note_keywords(def_module, id_name.to_string(), &names, def);
     let mut expansion =
         if def.expansion != Expansion::None && requests_parametrized_fixture(contexts, &[], def) {
             Expansion::Fallback
@@ -2449,6 +2483,8 @@ fn emit_class(
                 continue;
             }
         }
+        let key = format!("{}::{}", stack.join("::"), def.name);
+        resolver.note_keywords(module, key, &names, def);
         // Any exact expansion — the method's own or one applied by the
         // class — is invalid if the test requests a parametrized fixture
         // (leaf-module visibility applies to inherited methods too), or if
