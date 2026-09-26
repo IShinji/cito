@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml reuses this workflow as the gate in front of `publish`.
+  workflow_call:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,56 +18,77 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { os: ubuntu-latest, experimental: false }
-          - { os: macos-14, experimental: false }
-          - { os: windows-latest, experimental: false }
+        os: [ubuntu-latest, macos-14, windows-latest]
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.experimental }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
         if: matrix.os == 'ubuntu-latest'
       - run: cargo clippy --all-targets -- -D warnings
-        if: matrix.os == 'ubuntu-latest'
       - run: cargo test
 
-  pytest-parity:
+  msrv:
+    name: MSRV (rust-version in Cargo.toml)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the MSRV toolchain
+        run: |
+          msrv="$(grep -m1 '^rust-version = ' Cargo.toml | cut -d'"' -f2)"
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+          rustup toolchain install "$msrv" --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # `+toolchain` overrides rust-toolchain.toml's `stable` channel.
+      - run: cargo +"$MSRV" check --locked --all-targets
+
+  pytest-parity:
+    name: pytest parity (pytest ${{ matrix.pytest }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # README promises node-ID parity with pytest 8.x and 9.x.
+        pytest: ["8.4.2", "9.1.1"]
+    runs-on: ubuntu-latest
+    env:
+      PYTEST: pytest==${{ matrix.pytest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - run: cargo build --release
       - name: Differential check on fixtures
         run: |
-          uv run --no-project --with pytest scripts/diff_collect.py tests/fixtures/basic
-          uv run --no-project --with pytest scripts/diff_collect.py tests/fixtures/configured
+          uv run --no-project --with "$PYTEST" scripts/diff_collect.py tests/fixtures/basic
+          uv run --no-project --with "$PYTEST" scripts/diff_collect.py tests/fixtures/configured
       - name: Differential check with -m deselection
         run: |
-          uv run --no-project --with pytest scripts/diff_collect.py tests/fixtures/basic -- -m "not slow"
+          uv run --no-project --with "$PYTEST" scripts/diff_collect.py tests/fixtures/basic -- -m "not slow"
       - name: Differential check with plugins (asyncio, hypothesis)
         run: |
-          uv run --no-project --with pytest --with pytest-asyncio --with hypothesis \
+          uv run --no-project --with "$PYTEST" --with pytest-asyncio --with hypothesis \
             scripts/diff_collect.py tests/fixtures/plugins
       - name: Differential fuzzing (3 seeds)
         run: |
           for seed in 11 42 77; do
-            python3 bench/fuzz_gen.py --seed $seed --out /tmp/fuzz-$seed
-            uv run --no-project --with pytest scripts/diff_collect.py /tmp/fuzz-$seed
+            python3 bench/fuzz_gen.py --seed $seed --out "$RUNNER_TEMP/fuzz-$seed" --force
+            uv run --no-project --with "$PYTEST" scripts/diff_collect.py "$RUNNER_TEMP/fuzz-$seed"
           done
       - name: Differential check on a generated corpus
         run: |
-          python3 bench/gen_corpus.py --files 60 --tests 10 --out /tmp/corpus
-          uv run --no-project --with pytest scripts/diff_collect.py /tmp/corpus
+          python3 bench/gen_corpus.py --files 60 --tests 10 --out "$RUNNER_TEMP/corpus" --force
+          uv run --no-project --with "$PYTEST" scripts/diff_collect.py "$RUNNER_TEMP/corpus"
       - name: Differential check against pytest's own test suite
+        # Pinned to the 9.1.1 tag (its suite needs its own pytest), so run once.
+        if: matrix.pytest == '9.1.1'
         run: |
-          git clone --depth 1 --branch 9.1.1 https://github.com/pytest-dev/pytest /tmp/pytest-repo
-          uv venv /tmp/ptv
-          uv pip install --python /tmp/ptv/bin/python "pytest==9.1.1" \
+          git clone --depth 1 --branch 9.1.1 https://github.com/pytest-dev/pytest "$RUNNER_TEMP/pytest-repo"
+          uv venv "$RUNNER_TEMP/ptv"
+          uv pip install --python "$RUNNER_TEMP/ptv/bin/python" "pytest==9.1.1" \
             xmlschema pygments attrs mock setuptools hypothesis
-          python3 scripts/diff_collect.py /tmp/pytest-repo \
-            --python /tmp/ptv/bin/python --ignore-missing test_doctest.txt
+          python3 scripts/diff_collect.py "$RUNNER_TEMP/pytest-repo" \
+            --python "$RUNNER_TEMP/ptv/bin/python" --ignore-missing test_doctest.txt

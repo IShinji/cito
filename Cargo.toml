@@ -2,6 +2,8 @@
 name = "cito"
 version = "0.3.0"
 edition = "2021"
+# MSRV: the ruff_python_* 0.0.3 crates require 1.94 (checked in CI).
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 description = "A fast, pytest-compatible test collector and runner, written in Rust."
 repository = "https://github.com/IShinji/cito"
