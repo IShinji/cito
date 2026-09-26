@@ -55,12 +55,27 @@ struct TestDef {
     /// Body is exactly `return <expr>` with a constant-evaluable expr —
     /// usable as a platform predicate (`if is_win32():`).
     returns_const: Option<bool>,
+    /// `func.__test__ = False` was assigned: pytest skips the function.
+    not_test: bool,
 }
 
 #[derive(Debug)]
 enum ClassItem {
     Method(TestDef),
     Nested(String, Class),
+    /// A non-callable class attribute (`test_x = None`, `test_data =
+    /// dict(...)`): never a test, but it claims the name, shadowing an
+    /// inherited method of the same name.
+    Attr(String),
+}
+
+impl ClassItem {
+    fn name(&self) -> &str {
+        match self {
+            ClassItem::Method(def) => def.name.as_str(),
+            ClassItem::Nested(name, _) | ClassItem::Attr(name) => name.as_str(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -72,12 +87,70 @@ struct Class {
     marks: Vec<String>,
     expansion: Expansion,
     has_ctor: bool,
+    /// Literal `__test__ = ...` in the class body: None = not assigned,
+    /// Some(None) = assigned a non-literal, Some(Some(b)) = literal bool.
+    dunder_test: Option<Option<bool>>,
 }
 
+/// A module-namespace binding pytest may collect, in `__dict__` order.
 #[derive(Debug)]
 enum TopItem {
     Func(TestDef),
     Class(String),
+    /// `from M import name` — collected at the import's position.
+    Import(String),
+    /// `X = SomeStateMachine.TestCase` synthetic unittest class.
+    Synthetic(String),
+}
+
+impl TopItem {
+    fn name(&self) -> &str {
+        match self {
+            TopItem::Func(def) => def.name.as_str(),
+            TopItem::Class(name) | TopItem::Import(name) | TopItem::Synthetic(name) => {
+                name.as_str()
+            }
+        }
+    }
+}
+
+/// The module namespace as an insertion-ordered dict: rebinding a name
+/// keeps its original slot (Python dict semantics), `del` frees the slot so
+/// a later rebinding appends at the end.
+#[derive(Debug, Default)]
+struct Namespace {
+    slots: Vec<Option<TopItem>>,
+    index: HashMap<String, usize>,
+}
+
+impl Namespace {
+    fn bind(&mut self, item: TopItem) {
+        match self.index.get(item.name()) {
+            Some(&i) => {
+                // A local def/class always wins over an import of the same
+                // name (conditional-import fallbacks), whatever the order.
+                let keep_local = matches!(item, TopItem::Import(_) | TopItem::Synthetic(_))
+                    && matches!(self.slots[i], Some(TopItem::Func(_) | TopItem::Class(_)));
+                if !keep_local {
+                    self.slots[i] = Some(item);
+                }
+            }
+            None => {
+                self.index.insert(item.name().to_string(), self.slots.len());
+                self.slots.push(Some(item));
+            }
+        }
+    }
+
+    fn remove(&mut self, name: &str) {
+        if let Some(i) = self.index.remove(name) {
+            self.slots[i] = None;
+        }
+    }
+
+    fn into_order(self) -> Vec<TopItem> {
+        self.slots.into_iter().flatten().collect()
+    }
 }
 
 /// A branch guard resolvable only with cross-file or environment knowledge.
@@ -115,6 +188,12 @@ struct Module {
     functions: HashMap<String, TestDef>,
     fixtures: HashMap<String, Fixture>,
     order: Vec<TopItem>,
+    /// Namespace being built during the scan; drained into `order`.
+    namespace: Namespace,
+    /// Module-level `__test__ = False`: pytest collects nothing here.
+    not_test: bool,
+    /// Functions marked `func.__test__ = False` at module level.
+    not_test_funcs: HashSet<String>,
     /// Module names demanded via module-level `pytest.importorskip(...)`.
     skip_requires: Vec<String>,
     /// A module-level `pytest.skip(...)` call (possibly behind an `if`):
@@ -124,14 +203,12 @@ struct Module {
     helper_calls: Vec<String>,
     /// `NAME = import_module('mod')` / importorskip bindings.
     import_bindings: HashMap<String, String>,
-    /// `X = Machine.TestCase` synthetic unittest classes.
-    synthetic_testcases: Vec<String>,
     /// Top-level defs guarded by a condition we can only resolve at emit
     /// time (imported predicates, import-availability bindings).
     cond_blocks: Vec<(DeferredGuard, Vec<String>)>,
     /// Names defined on unconditional top-level paths (never deadened).
     certain_names: HashSet<String>,
-    /// Names removed via module-level `del NAME` — pytest never sees them.
+    /// Names removed via module-level `del NAME` and not rebound after.
     deleted_names: HashSet<String>,
     /// Module-level `pytestmark = ...` mark names.
     pytestmark: Vec<String>,
@@ -139,9 +216,11 @@ struct Module {
     mark_aliases: HashMap<String, String>,
     /// `pytest_plugins = [...]` declarations (conftest only, per pytest).
     plugin_modules: Vec<String>,
-    /// conftest.py `collect_ignore` / `collect_ignore_glob` (literal lists).
-    collect_ignore: Vec<String>,
-    collect_ignore_glob: Vec<String>,
+    /// conftest.py `collect_ignore` / `collect_ignore_glob` (literal
+    /// entries). None = the name is not defined here; pytest consults only
+    /// the nearest conftest that defines it.
+    collect_ignore: Option<Vec<String>>,
+    collect_ignore_glob: Option<Vec<String>>,
     /// A `pytest_generate_tests` hook here parametrizes tests in ways static
     /// analysis cannot see; all expansions in scope must fall back.
     has_generate_tests: bool,
@@ -223,6 +302,7 @@ fn test_def(func: &ast::StmtFunctionDef, aliases: &params::ParamAliases) -> Test
         maybe_marks: info.unresolved,
         skips_module: body_calls_skip(&func.body),
         returns_const: const_return(&func.body),
+        not_test: false,
     }
 }
 
@@ -336,21 +416,6 @@ fn parse_file(path: &Path) -> Option<Module> {
     }
 }
 
-/// Python shadowing: a later `def`/`class` with the same name replaces the
-/// earlier one; pytest collects only the surviving object, located at its
-/// last definition site. Keep the LAST occurrence of each name.
-fn dedupe_keep_last<T>(items: Vec<T>, name_of: impl Fn(&T) -> &str) -> Vec<T> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut kept: Vec<T> = Vec::new();
-    for item in items.into_iter().rev() {
-        if seen.insert(name_of(&item).to_string()) {
-            kept.push(item);
-        }
-    }
-    kept.reverse();
-    kept
-}
-
 fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser::ParseError> {
     let syntax = ruff_python_parser::parse_module(source)?.into_syntax();
     let mut module = Module {
@@ -363,27 +428,26 @@ fn parse_source(path: &Path, source: &str) -> Result<Module, ruff_python_parser:
         functions: HashMap::new(),
         fixtures: HashMap::new(),
         order: Vec::new(),
+        namespace: Namespace::default(),
+        not_test: false,
+        not_test_funcs: HashSet::new(),
         skip_requires: Vec::new(),
         has_module_skip: false,
         helper_calls: Vec::new(),
         import_bindings: HashMap::new(),
-        synthetic_testcases: Vec::new(),
         cond_blocks: Vec::new(),
         certain_names: HashSet::new(),
         deleted_names: HashSet::new(),
         pytestmark: Vec::new(),
         mark_aliases: HashMap::new(),
         plugin_modules: Vec::new(),
-        collect_ignore: Vec::new(),
-        collect_ignore_glob: Vec::new(),
+        collect_ignore: None,
+        collect_ignore_glob: None,
         has_generate_tests: false,
     };
     let mut aliases = params::ParamAliases::new();
     scan(&syntax.body, &mut module, &mut aliases, true, true);
-    module.order = dedupe_keep_last(std::mem::take(&mut module.order), |item| match item {
-        TopItem::Func(def) => def.name.as_str(),
-        TopItem::Class(name) => name.as_str(),
-    });
+    module.order = std::mem::take(&mut module.namespace).into_order();
     Ok(module)
 }
 
@@ -422,7 +486,8 @@ fn scan(
                 }
                 let def = test_def(func, aliases);
                 module.functions.insert(def.name.clone(), def.clone());
-                module.order.push(TopItem::Func(def));
+                module.deleted_names.remove(&def.name);
+                module.namespace.bind(TopItem::Func(def));
             }
             Stmt::ClassDef(class) if top => {
                 if certain {
@@ -432,7 +497,8 @@ fn scan(
                 module
                     .classes
                     .insert(name.clone(), build_class(class, aliases));
-                module.order.push(TopItem::Class(name));
+                module.deleted_names.remove(&name);
+                module.namespace.bind(TopItem::Class(name));
             }
             Stmt::Assign(assign) if top => {
                 // `NAME = pytest.mark.parametrize(...)` decorator aliases.
@@ -475,18 +541,32 @@ fn scan(
                     // stateful idiom): a synthetic unittest class.
                     if let Expr::Attribute(attr) = &*assign.value {
                         if attr.attr.as_str() == "TestCase" {
-                            module.synthetic_testcases.push(target.id.to_string());
+                            module.deleted_names.remove(target.id.as_str());
+                            module
+                                .namespace
+                                .bind(TopItem::Synthetic(target.id.to_string()));
                         }
                     }
                     // conftest collect_ignore lists (literal entries only).
                     if matches!(target.id.as_str(), "collect_ignore" | "collect_ignore_glob") {
                         let entries = string_list(&assign.value);
                         if target.id.as_str() == "collect_ignore" {
-                            module.collect_ignore.extend(entries);
+                            module.collect_ignore = Some(entries);
                         } else {
-                            module.collect_ignore_glob.extend(entries);
+                            module.collect_ignore_glob = Some(entries);
                         }
                     }
+                    // Module-level `__test__ = False` opts the module out.
+                    if target.id.as_str() == "__test__" {
+                        module.not_test = matches!(
+                            &*assign.value,
+                            Expr::BooleanLiteral(b) if !b.value
+                        );
+                    }
+                }
+                // `test_helper.__test__ = False` opts a function out.
+                if let Some(name) = dunder_test_false_target(assign) {
+                    module.not_test_funcs.insert(name);
                 }
                 // `mpl = pytest.importorskip("matplotlib")`.
                 if let Some(name) = importorskip_name(&assign.value) {
@@ -495,12 +575,20 @@ fn scan(
             }
             // `del TestFoo` at module level removes the binding before
             // pytest ever collects it (scipy's linprog class-factory idiom).
+            // Deletion is positional: a later rebinding is collected again.
             Stmt::Delete(delete) if top => {
                 for target in &delete.targets {
                     if let Expr::Name(name) = target {
                         module.deleted_names.insert(name.id.to_string());
                         module.certain_names.remove(name.id.as_str());
+                        module.namespace.remove(name.id.as_str());
                     }
+                }
+            }
+            // `collect_ignore += [...]` in a conftest.
+            Stmt::AugAssign(aug) if top && certain && matches!(aug.op, ast::Operator::Add) => {
+                if let Expr::Name(target) = &*aug.target {
+                    extend_ignore_list(module, target.id.as_str(), string_list(&aug.value));
                 }
             }
             // Only live (non-dead-branch) statements can skip the module
@@ -513,6 +601,20 @@ fn scan(
                 if is_module_skip_call(&expr_stmt.value) {
                     module.has_module_skip = true;
                 } else if let Expr::Call(call) = &*expr_stmt.value {
+                    // `collect_ignore.append("x")` / `.extend([...])` on an
+                    // unconditional path.
+                    if let Expr::Attribute(attr) = &*call.func {
+                        if let (true, Expr::Name(list), Some(arg)) =
+                            (certain, &*attr.value, call.arguments.args.first())
+                        {
+                            let entries = match attr.attr.as_str() {
+                                "append" => string_value_of(arg).into_iter().collect(),
+                                "extend" => string_list(arg),
+                                _ => Vec::new(),
+                            };
+                            extend_ignore_list(module, list.id.as_str(), entries);
+                        }
+                    }
                     let name = match &*call.func {
                         Expr::Name(name) => Some(name.id.to_string()),
                         Expr::Attribute(attr) => Some(attr.attr.to_string()),
@@ -574,6 +676,8 @@ fn scan(
                         .as_ref()
                         .map(|a| a.to_string())
                         .unwrap_or_else(|| alias.name.to_string());
+                    module.deleted_names.remove(&local);
+                    module.namespace.bind(TopItem::Import(local.clone()));
                     module
                         .imports
                         .insert(local, Import::From(mref.clone(), alias.name.to_string()));
@@ -625,21 +729,22 @@ fn scan(
                     cond != Some(false),
                     certain && cond == Some(true),
                 );
-                // else/elif run when the if-condition is false or unknown;
-                // elif conditions are rarely used in these guards, so treat
-                // them like the else arm.
-                let else_live = cond != Some(true);
+                // An elif/else arm runs only when every earlier arm is false
+                // or unknown: once an arm is statically true, the rest are
+                // dead. It is certain only when all earlier arms are
+                // statically false and its own test is true (or absent).
+                let mut earlier_true = cond == Some(true);
+                let mut earlier_false = cond == Some(false);
                 for clause in &if_stmt.elif_else_clauses {
-                    let clause_cond = clause.test.as_ref().and_then(eval_condition);
-                    let live = else_live && clause_cond != Some(false);
-                    let clause_certain = certain
-                        && cond == Some(false)
-                        && clause
-                            .test
-                            .as_ref()
-                            .map(|t| eval_condition(t) == Some(true))
-                            .unwrap_or(true);
+                    let clause_cond = match &clause.test {
+                        Some(test) => eval_condition(test),
+                        None => Some(true),
+                    };
+                    let live = !earlier_true && clause_cond != Some(false);
+                    let clause_certain = certain && earlier_false && clause_cond == Some(true);
                     scan(&clause.body, module, aliases, live, clause_certain);
+                    earlier_true |= clause_cond == Some(true);
+                    earlier_false &= clause_cond == Some(false);
                 }
             }
             Stmt::Try(try_stmt) if top => {
@@ -706,7 +811,8 @@ fn scan(
                 scan(&try_stmt.orelse, module, aliases, false, false);
                 scan(&try_stmt.finalbody, module, aliases, false, false);
             }
-            Stmt::With(with_stmt) => scan(&with_stmt.body, module, aliases, false, certain),
+            // A `with` body always runs: its defs are module members.
+            Stmt::With(with_stmt) => scan(&with_stmt.body, module, aliases, top, certain),
             _ => {}
         }
     }
@@ -719,9 +825,17 @@ fn build_class(class: &ast::StmtClassDef, aliases: &params::ParamAliases) -> Cla
         .map(|args| args.args.iter().filter_map(base_text).collect())
         .unwrap_or_default();
     let class_info = params::from_decorators(&class.decorator_list, aliases);
-    let mut items = Vec::new();
+    // The class body is a namespace too: a rebound name keeps its first
+    // slot and takes the last value.
+    let mut items: Vec<ClassItem> = Vec::new();
+    let mut bind = |item: ClassItem| match items.iter().position(|i| i.name() == item.name()) {
+        Some(i) => items[i] = item,
+        None => items.push(item),
+    };
     let mut fixtures = HashMap::new();
     let mut has_ctor = false;
+    let mut dunder_test = None;
+    let mut not_tests: HashSet<String> = HashSet::new();
     for stmt in &class.body {
         match stmt {
             Stmt::FunctionDef(func) => {
@@ -745,40 +859,55 @@ fn build_class(class: &ast::StmtClassDef, aliases: &params::ParamAliases) -> Cla
                 // Class-level usefixtures apply to every method.
                 def.args
                     .extend(class_info.extra_fixture_requests.iter().cloned());
-                items.push(ClassItem::Method(def));
+                bind(ClassItem::Method(def));
             }
             Stmt::ClassDef(nested) => {
-                items.push(ClassItem::Nested(
+                bind(ClassItem::Nested(
                     nested.name.to_string(),
                     build_class(nested, aliases),
                 ));
             }
-            // `test_kat = generate_encrypt_test(...)`: factory-made test
-            // methods bound as class attributes (cryptography's idiom).
-            // Parametrization is invisible, so they emit as bare names.
             Stmt::Assign(assign) => {
-                if let ([Expr::Name(target)], Expr::Call(_)) =
-                    (assign.targets.as_slice(), &*assign.value)
-                {
-                    items.push(ClassItem::Method(TestDef {
-                        name: target.id.to_string(),
-                        expansion: Expansion::Fallback,
-                        args: Vec::new(),
-                        claimed: Vec::new(),
-                        marks: Vec::new(),
-                        maybe_marks: Vec::new(),
-                        skips_module: false,
-                        returns_const: None,
-                    }));
+                if let Some(name) = dunder_test_false_target(assign) {
+                    not_tests.insert(name);
+                    continue;
+                }
+                let [Expr::Name(target)] = assign.targets.as_slice() else {
+                    continue;
+                };
+                let name = target.id.to_string();
+                if name == "__test__" {
+                    dunder_test = Some(match &*assign.value {
+                        Expr::BooleanLiteral(b) => Some(b.value),
+                        _ => None,
+                    });
+                    continue;
+                }
+                match attr_kind(&assign.value) {
+                    AttrKind::Callable => bind(ClassItem::Method(factory_def(name))),
+                    AttrKind::NotCallable => bind(ClassItem::Attr(name)),
+                    AttrKind::Unknown => {}
+                }
+            }
+            Stmt::AnnAssign(assign) => {
+                if let (Expr::Name(target), Some(value)) = (&*assign.target, &assign.value) {
+                    match attr_kind(value) {
+                        AttrKind::Callable => {
+                            bind(ClassItem::Method(factory_def(target.id.to_string())))
+                        }
+                        AttrKind::NotCallable => bind(ClassItem::Attr(target.id.to_string())),
+                        AttrKind::Unknown => {}
+                    }
                 }
             }
             _ => {}
         }
     }
-    let items = dedupe_keep_last(items, |item| match item {
-        ClassItem::Method(def) => def.name.as_str(),
-        ClassItem::Nested(name, _) => name.as_str(),
-    });
+    for item in &mut items {
+        if let ClassItem::Method(def) = item {
+            def.not_test = not_tests.contains(&def.name);
+        }
+    }
     Class {
         bases,
         items,
@@ -787,7 +916,111 @@ fn build_class(class: &ast::StmtClassDef, aliases: &params::ParamAliases) -> Cla
         marks: class_info.marks,
         expansion: class_info.expansion,
         has_ctor,
+        dunder_test,
     }
+}
+
+/// `test_kat = generate_encrypt_test(...)`: factory-made test methods bound
+/// as class attributes (cryptography's idiom). Parametrization is
+/// invisible, so they emit as bare names.
+fn factory_def(name: String) -> TestDef {
+    TestDef {
+        name,
+        expansion: Expansion::Fallback,
+        args: Vec::new(),
+        claimed: Vec::new(),
+        marks: Vec::new(),
+        maybe_marks: Vec::new(),
+        skips_module: false,
+        returns_const: None,
+        not_test: false,
+    }
+}
+
+enum AttrKind {
+    Callable,
+    NotCallable,
+    Unknown,
+}
+
+/// Is a class attribute's value callable (pytest collects callable
+/// test-named attributes)? Literals, displays and calls to builtin
+/// constructors of plain data are not; lambdas and other calls (test
+/// factories, decorators applied by hand) are assumed to be. Bare names and
+/// attribute references are undecidable and bind nothing.
+fn attr_kind(value: &Expr) -> AttrKind {
+    match value {
+        Expr::Lambda(_) => AttrKind::Callable,
+        Expr::Call(call) => {
+            let data_ctor = match &*call.func {
+                Expr::Name(name) => matches!(
+                    name.id.as_str(),
+                    "dict"
+                        | "list"
+                        | "set"
+                        | "frozenset"
+                        | "tuple"
+                        | "str"
+                        | "bytes"
+                        | "bytearray"
+                        | "int"
+                        | "float"
+                        | "complex"
+                        | "bool"
+                        | "range"
+                        | "object"
+                        | "OrderedDict"
+                        | "defaultdict"
+                        | "Counter"
+                        | "deque"
+                ),
+                _ => false,
+            };
+            if data_ctor {
+                AttrKind::NotCallable
+            } else {
+                AttrKind::Callable
+            }
+        }
+        Expr::NoneLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::FString(_)
+        | Expr::EllipsisLiteral(_)
+        | Expr::List(_)
+        | Expr::Tuple(_)
+        | Expr::Dict(_)
+        | Expr::Set(_)
+        | Expr::ListComp(_)
+        | Expr::SetComp(_)
+        | Expr::DictComp(_)
+        | Expr::Generator(_) => AttrKind::NotCallable,
+        _ => AttrKind::Unknown,
+    }
+}
+
+/// `NAME.__test__ = False` — the name whose collection is switched off.
+fn dunder_test_false_target(assign: &ast::StmtAssign) -> Option<String> {
+    let [Expr::Attribute(attr)] = assign.targets.as_slice() else {
+        return None;
+    };
+    let Expr::Name(owner) = &*attr.value else {
+        return None;
+    };
+    let is_false = matches!(&*assign.value, Expr::BooleanLiteral(b) if !b.value);
+    (attr.attr.as_str() == "__test__" && is_false).then(|| owner.id.to_string())
+}
+
+/// `collect_ignore.append(...)` / `+= [...]` onto a conftest ignore list.
+fn extend_ignore_list(module: &mut Module, list: &str, entries: Vec<String>) {
+    let target = match list {
+        "collect_ignore" => &mut module.collect_ignore,
+        "collect_ignore_glob" => &mut module.collect_ignore_glob,
+        _ => return,
+    };
+    target.get_or_insert_with(Vec::new).extend(entries);
 }
 
 fn string_value_of(expr: &Expr) -> Option<String> {
@@ -1065,6 +1298,7 @@ struct Resolver<'a> {
     /// The probe python's sys.path entries — lets absolute imports resolve
     /// into site-packages (e.g. external TestCase base classes). Lazy.
     sys_paths: Option<Vec<PathBuf>>,
+    mro_cache: HashMap<ClassKey, (Vec<MroClass>, bool)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -1075,6 +1309,7 @@ impl<'a> Resolver<'a> {
             probe_python,
             probe_cache: HashMap::new(),
             sys_paths: None,
+            mro_cache: HashMap::new(),
         }
     }
 
@@ -1394,50 +1629,19 @@ print(json.dumps(result))
         }
     }
 
-    /// Effective test-method list for a class: own methods first, then
-    /// inherited ones (base order, depth-first), overrides deduped. Methods
-    /// requesting a parametrized fixture from their *defining* module are
-    /// downgraded to Fallback here; the leaf module's fixtures are re-checked
-    /// at emission. Returns (methods, reaches_unittest, any_base_class_params).
-    fn resolve_class(
+    /// C3 linearization of the resolvable bases of a class (the class
+    /// itself excluded), plus whether any base reaches unittest.TestCase.
+    /// Unresolvable bases contribute nothing. `stack` guards cycles.
+    fn mro_bases(
         &mut self,
         module: &Rc<Module>,
-        class: &Class,
-        key: (PathBuf, String),
-        visited: &mut HashSet<(PathBuf, String)>,
-    ) -> (
-        Vec<TestDef>,
-        bool,
-        bool,
-        HashMap<String, Fixture>,
-        Vec<String>,
-    ) {
-        visited.insert(key);
-        let mut methods: Vec<TestDef> = Vec::new();
-        let mut chain_fixtures: HashMap<String, Fixture> = class.fixtures.clone();
-        let mut chain_marks: Vec<String> = class.marks.clone();
-        let mut seen: HashSet<String> = HashSet::new();
-        for item in &class.items {
-            if let ClassItem::Method(def) = item {
-                if seen.insert(def.name.clone()) {
-                    let mut def = def.clone();
-                    if def.expansion != Expansion::None
-                        && (module.has_generate_tests
-                            || requests_parametrized_fixture(
-                                std::slice::from_ref(module),
-                                &[&class.fixtures],
-                                &def,
-                            ))
-                    {
-                        def.expansion = Expansion::Fallback;
-                    }
-                    methods.push(def);
-                }
-            }
-        }
+        bases: &[String],
+        stack: &mut Vec<ClassKey>,
+    ) -> (Vec<MroClass>, bool) {
         let mut unittest = false;
-        let mut base_params = false;
-        for base in &class.bases {
+        let mut seqs: Vec<Vec<MroClass>> = Vec::new();
+        let mut direct: Vec<MroClass> = Vec::new();
+        for base in bases {
             match self.resolve_base(module, base) {
                 BaseTarget::Unittest => unittest = true,
                 BaseTarget::Local(target_mod, target_name) => {
@@ -1446,34 +1650,185 @@ print(json.dumps(result))
                         unittest = true;
                         continue;
                     }
-                    let key = (target_mod.path.clone(), target_name.clone());
-                    if visited.contains(&key) {
-                        continue;
-                    }
-                    let Some(target_class) = target_mod.classes.get(&target_name) else {
-                        continue;
-                    };
-                    base_params |= target_class.expansion != Expansion::None
-                        || has_autouse_params(&target_class.fixtures);
-                    let (inherited, base_ut, base_bp, base_fixtures, base_marks) =
-                        self.resolve_class(&target_mod, target_class, key, visited);
-                    unittest |= base_ut;
-                    base_params |= base_bp;
-                    for (name, fixture) in base_fixtures {
-                        chain_fixtures.entry(name).or_insert(fixture);
-                    }
-                    chain_marks.extend(base_marks);
-                    for def in inherited {
-                        if seen.insert(def.name.clone()) {
-                            methods.push(def);
-                        }
+                    if let Some((lin, base_ut)) = self.mro_top(&target_mod, &target_name, stack) {
+                        unittest |= base_ut;
+                        direct.push(lin[0].clone());
+                        seqs.push(lin);
                     }
                 }
                 BaseTarget::Unknown => {}
             }
         }
-        (methods, unittest, base_params, chain_fixtures, chain_marks)
+        seqs.push(direct);
+        (c3_merge(seqs), unittest)
     }
+
+    /// Linearization of a top-level class, itself first (memoized).
+    fn mro_top(
+        &mut self,
+        module: &Rc<Module>,
+        name: &str,
+        stack: &mut Vec<ClassKey>,
+    ) -> Option<(Vec<MroClass>, bool)> {
+        let key = (module.path.clone(), name.to_string());
+        if let Some(hit) = self.mro_cache.get(&key) {
+            return Some(hit.clone());
+        }
+        if stack.contains(&key) {
+            return None;
+        }
+        let class = module.classes.get(name)?;
+        stack.push(key.clone());
+        let (tail, unittest) = self.mro_bases(module, &class.bases, stack);
+        stack.pop();
+        let mut lin = vec![(module.clone(), name.to_string())];
+        lin.extend(tail);
+        self.mro_cache.insert(key, (lin.clone(), unittest));
+        Some((lin, unittest))
+    }
+
+    /// A class's effective collectable members, in pytest's order: walk the
+    /// MRO (C3) claiming each name for the first class defining it, then
+    /// emit class by class in REVERSE MRO order (base members first), each
+    /// class in definition order. Methods requesting a parametrized fixture
+    /// from their *defining* module are downgraded to Fallback here; the
+    /// leaf module's fixtures are re-checked at emission.
+    fn resolve_class(&mut self, module: &Rc<Module>, class: &Class, key: ClassKey) -> Resolved {
+        let mut stack = vec![key];
+        let (bases, unittest) = self.mro_bases(module, &class.bases, &mut stack);
+        let mut resolved = Resolved {
+            items: Vec::new(),
+            unittest,
+            base_params: false,
+            fixtures: HashMap::new(),
+            marks: Vec::new(),
+            has_ctor: false,
+            dunder_test: None,
+        };
+        let entries = std::iter::once((module.clone(), None))
+            .chain(bases.into_iter().map(|(m, n)| (m, Some(n))));
+        let mut dunder_test: Option<Option<bool>> = None;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut groups: Vec<Vec<ResolvedItem>> = Vec::new();
+        for (entry_mod, owner) in entries {
+            let entry_class = match &owner {
+                None => class,
+                Some(name) => match entry_mod.classes.get(name) {
+                    Some(c) => c,
+                    None => continue,
+                },
+            };
+            for (name, fixture) in &entry_class.fixtures {
+                resolved
+                    .fixtures
+                    .entry(name.clone())
+                    .or_insert_with(|| fixture.clone());
+            }
+            resolved.marks.extend(entry_class.marks.iter().cloned());
+            resolved.has_ctor |= entry_class.has_ctor;
+            if dunder_test.is_none() {
+                dunder_test = entry_class.dunder_test;
+            }
+            if owner.is_some() {
+                resolved.base_params |= entry_class.expansion != Expansion::None
+                    || has_autouse_params(&entry_class.fixtures);
+            }
+            let mut group = Vec::new();
+            for item in &entry_class.items {
+                if !seen.insert(item.name().to_string()) {
+                    continue;
+                }
+                match item {
+                    ClassItem::Method(def) => {
+                        let mut def = def.clone();
+                        if def.expansion != Expansion::None
+                            && (entry_mod.has_generate_tests
+                                || requests_parametrized_fixture(
+                                    std::slice::from_ref(&entry_mod),
+                                    &[&entry_class.fixtures],
+                                    &def,
+                                ))
+                        {
+                            def.expansion = Expansion::Fallback;
+                        }
+                        group.push(ResolvedItem::Method(def));
+                    }
+                    ClassItem::Nested(name, _) => group.push(ResolvedItem::Nested {
+                        module: entry_mod.clone(),
+                        owner: owner.clone(),
+                        name: name.clone(),
+                    }),
+                    ClassItem::Attr(_) => {}
+                }
+            }
+            groups.push(group);
+        }
+        resolved.dunder_test = dunder_test.flatten();
+        resolved.items = groups.into_iter().rev().flatten().collect();
+        resolved
+    }
+}
+
+type ClassKey = (PathBuf, String);
+/// A resolvable top-level class: its module and name.
+type MroClass = (Rc<Module>, String);
+
+/// C3 merge of linearizations. An inconsistent hierarchy (which Python
+/// would reject) falls back to first-occurrence order.
+fn c3_merge(mut seqs: Vec<Vec<MroClass>>) -> Vec<MroClass> {
+    let same = |a: &MroClass, b: &MroClass| a.1 == b.1 && a.0.path == b.0.path;
+    let mut out: Vec<MroClass> = Vec::new();
+    loop {
+        seqs.retain(|s| !s.is_empty());
+        if seqs.is_empty() {
+            return out;
+        }
+        let candidate = seqs
+            .iter()
+            .map(|s| &s[0])
+            .find(|head| !seqs.iter().any(|s| s[1..].iter().any(|c| same(c, head))))
+            .cloned();
+        let Some(candidate) = candidate else {
+            for c in seqs.into_iter().flatten() {
+                if !out.iter().any(|o| same(o, &c)) {
+                    out.push(c);
+                }
+            }
+            return out;
+        };
+        for s in &mut seqs {
+            if same(&s[0], &candidate) {
+                s.remove(0);
+            }
+        }
+        out.push(candidate);
+    }
+}
+
+/// A class resolved against its MRO.
+struct Resolved {
+    items: Vec<ResolvedItem>,
+    unittest: bool,
+    /// Some base class is parametrized (or has parametrized autouse
+    /// fixtures).
+    base_params: bool,
+    fixtures: HashMap<String, Fixture>,
+    marks: Vec<String>,
+    /// Some class in the MRO defines `__init__` / `__new__`.
+    has_ctor: bool,
+    /// Effective literal `__test__` (first MRO class assigning it).
+    dunder_test: Option<bool>,
+}
+
+enum ResolvedItem {
+    Method(TestDef),
+    /// Nested class `name` defined in `module`, inside the leaf class
+    /// (`owner` None) or inside the top-level base class `owner`.
+    Nested {
+        module: Rc<Module>,
+        owner: Option<String>,
+        name: String,
+    },
 }
 
 /// The directory above the topmost package containing `dir` — a sys.path
@@ -1716,24 +2071,8 @@ fn emit_module(
         }
     }
 
-    // conftest `collect_ignore` / `collect_ignore_glob` drop matching files
-    // (literal entries only; computed appends are invisible to us).
-    for conftest in contexts.iter().skip(1) {
-        for entry in &conftest.collect_ignore {
-            if conftest.dir.join(entry) == module.path {
-                return Vec::new();
-            }
-        }
-        if let Ok(rel) = module.path.strip_prefix(&conftest.dir) {
-            for pattern in &conftest.collect_ignore_glob {
-                if globset::Glob::new(pattern)
-                    .map(|g| g.compile_matcher().is_match(rel))
-                    .unwrap_or(false)
-                {
-                    return Vec::new();
-                }
-            }
-        }
+    if module.not_test || is_collect_ignored(resolver, &module.path) {
+        return Vec::new();
     }
 
     // With a probe python, module-level `importorskip` in the file or its
@@ -1820,50 +2159,21 @@ fn emit_module(
 
     let mut tests = Vec::new();
     for item in &module.order {
-        let item_name = match item {
-            TopItem::Func(def) => def.name.as_str(),
-            TopItem::Class(name) => name.as_str(),
-        };
-        if dead.contains(item_name) {
-            continue;
-        }
         match item {
             TopItem::Func(def) => {
+                if dead.contains(&def.name) || module.not_test_funcs.contains(&def.name) {
+                    continue;
+                }
                 if resolver.config.function_matches(&def.name) {
-                    let mut names: HashSet<String> = module
-                        .pytestmark
-                        .iter()
-                        .chain(def.marks.iter())
-                        .cloned()
-                        .collect();
-                    for candidate in &def.maybe_marks {
-                        if let Some(mark) = resolver.resolve_mark_alias(module, candidate) {
-                            names.insert(mark);
-                        }
-                    }
-                    if let Some(expr) = marker {
-                        if !expr.matches_names(&names) {
-                            continue;
-                        }
-                    }
-                    let mut expansion = if def.expansion != Expansion::None
-                        && requests_parametrized_fixture(&contexts, &[], def)
-                    {
-                        Expansion::Fallback
-                    } else {
-                        def.expansion.clone()
-                    };
-                    // The anyio plugin parametrizes marked tests with the
-                    // backend fixture, adding ID pieces we cannot see.
-                    if (poisoned || names.contains("anyio"))
-                        && matches!(expansion, Expansion::Params(_))
-                    {
-                        expansion = Expansion::Fallback;
-                    }
-                    tests.extend(expansion.apply(&def.name));
+                    emit_function(
+                        resolver, module, def, &def.name, &contexts, poisoned, marker, &mut tests,
+                    );
                 }
             }
             TopItem::Class(name) => {
+                if dead.contains(name) {
+                    continue;
+                }
                 let Some(class) = module.classes.get(name) else {
                     continue;
                 };
@@ -1880,106 +2190,157 @@ fn emit_module(
                     &mut tests,
                 );
             }
-        }
-    }
-
-    // `X = SomeStateMachine.TestCase` bindings (hypothesis stateful): a
-    // unittest TestCase whose single test method is runTest.
-    for name in &module.synthetic_testcases {
-        if dead.contains(name) || module.classes.contains_key(name) {
-            continue;
-        }
-        if let Some(expr) = marker {
-            let names: HashSet<String> = module.pytestmark.iter().cloned().collect();
-            if !expr.matches_names(&names) {
-                continue;
-            }
-        }
-        tests.push(format!("{name}::runTest"));
-    }
-
-    // pytest collects over the module NAMESPACE: test classes/functions
-    // *imported* into a test module are collected here too (the classic
-    // urllib3 contrib pattern: `from ..test_https import TestHTTPS`).
-    let mut imported: Vec<(String, Rc<Module>, String)> = Vec::new(); // (local, module, original)
-    for (local, import) in &module.imports {
-        let Import::From(mref, orig) = import else {
-            continue;
-        };
-        let looks_like_class = resolver.config.class_matches(local);
-        let looks_like_func = resolver.config.function_matches(local);
-        if !looks_like_class && !looks_like_func {
-            continue;
-        }
-        if module.classes.contains_key(local) || module.functions.contains_key(local) {
-            continue; // a local definition shadows the import
-        }
-        if is_unittest_ref(mref, orig) {
-            continue;
-        }
-        if let Some(target) = resolver.resolve_ref(mref, &module.dir) {
-            imported.push((local.clone(), target, orig.clone()));
-        }
-    }
-    imported.sort_by(|a, b| a.0.cmp(&b.0));
-    for (local, target, orig) in imported {
-        let Some((target, orig)) = resolver.resolve_symbol_or_function(target, orig) else {
-            continue;
-        };
-        if resolver.config.class_matches(&local) {
-            if let Some(class) = target.classes.get(&orig) {
-                emit_class(
-                    resolver,
-                    &target.clone(),
-                    class,
-                    &local,
-                    &contexts,
-                    &module.pytestmark,
-                    poisoned,
-                    marker,
-                    &mut Vec::new(),
-                    &mut tests,
-                );
-                continue;
-            }
-        }
-        if resolver.config.function_matches(&local) {
-            if let Some(def) = target.functions.get(&orig) {
-                let mut names: HashSet<String> = module
-                    .pytestmark
-                    .iter()
-                    .chain(def.marks.iter())
-                    .cloned()
-                    .collect();
-                for candidate in &def.maybe_marks {
-                    if let Some(mark) = resolver.resolve_mark_alias(&target, candidate) {
-                        names.insert(mark);
-                    }
+            // `X = SomeStateMachine.TestCase` bindings (hypothesis
+            // stateful): a unittest TestCase whose single test method is
+            // runTest.
+            TopItem::Synthetic(name) => {
+                if dead.contains(name) || module.classes.contains_key(name) {
+                    continue;
                 }
                 if let Some(expr) = marker {
+                    let names: HashSet<String> = module.pytestmark.iter().cloned().collect();
                     if !expr.matches_names(&names) {
                         continue;
                     }
                 }
-                let mut expansion = if def.expansion != Expansion::None
-                    && requests_parametrized_fixture(&contexts, &[], def)
-                {
-                    Expansion::Fallback
-                } else {
-                    def.expansion.clone()
-                };
-                if (poisoned || names.contains("anyio"))
-                    && matches!(expansion, Expansion::Params(_))
-                {
-                    expansion = Expansion::Fallback;
-                }
-                for id in expansion.apply(&local) {
-                    tests.push(id);
-                }
+                tests.push(format!("{name}::runTest"));
+            }
+            // pytest collects over the module NAMESPACE: test classes and
+            // functions *imported* into a test module are collected here
+            // too, at the import's position (the classic urllib3 contrib
+            // pattern: `from ..test_https import TestHTTPS`).
+            TopItem::Import(local) => {
+                emit_imported(
+                    resolver, module, local, &contexts, poisoned, marker, &mut tests,
+                );
             }
         }
     }
     tests
+}
+
+/// Emit an imported test class/function bound as `local` in `module`.
+fn emit_imported(
+    resolver: &mut Resolver,
+    module: &Rc<Module>,
+    local: &str,
+    contexts: &[Rc<Module>],
+    poisoned: bool,
+    marker: Option<&crate::keyword::KExpr>,
+    tests: &mut Vec<String>,
+) {
+    let Some(Import::From(mref, orig)) = module.imports.get(local) else {
+        return;
+    };
+    let looks_like_class = resolver.config.class_matches(local);
+    let looks_like_func = resolver.config.function_matches(local);
+    if !looks_like_class && !looks_like_func {
+        return;
+    }
+    if module.classes.contains_key(local) || module.functions.contains_key(local) {
+        return; // a local definition shadows the import
+    }
+    if is_unittest_ref(mref, orig) {
+        return;
+    }
+    let Some(target) = resolver.resolve_ref(mref, &module.dir) else {
+        return;
+    };
+    let Some((target, orig)) = resolver.resolve_symbol_or_function(target, orig.clone()) else {
+        return;
+    };
+    if looks_like_class {
+        if let Some(class) = target.classes.get(&orig) {
+            emit_class(
+                resolver,
+                &target.clone(),
+                class,
+                local,
+                contexts,
+                &module.pytestmark,
+                poisoned,
+                marker,
+                &mut Vec::new(),
+                tests,
+            );
+            return;
+        }
+    }
+    if looks_like_func {
+        if let Some(def) = target.functions.get(&orig) {
+            if target.not_test_funcs.contains(&orig) {
+                return;
+            }
+            let pytestmark = &module.pytestmark;
+            emit_function_with(
+                resolver, &target, pytestmark, def, local, contexts, poisoned, marker, tests,
+            );
+        }
+    }
+}
+
+/// Emit a module-level test function of `module` under `id_name`.
+#[allow(clippy::too_many_arguments)]
+fn emit_function(
+    resolver: &mut Resolver,
+    module: &Rc<Module>,
+    def: &TestDef,
+    id_name: &str,
+    contexts: &[Rc<Module>],
+    poisoned: bool,
+    marker: Option<&crate::keyword::KExpr>,
+    tests: &mut Vec<String>,
+) {
+    emit_function_with(
+        resolver,
+        module,
+        &module.pytestmark,
+        def,
+        id_name,
+        contexts,
+        poisoned,
+        marker,
+        tests,
+    );
+}
+
+/// `def_module` resolves the def's mark aliases; `pytestmark` is the
+/// collecting module's.
+#[allow(clippy::too_many_arguments)]
+fn emit_function_with(
+    resolver: &mut Resolver,
+    def_module: &Rc<Module>,
+    pytestmark: &[String],
+    def: &TestDef,
+    id_name: &str,
+    contexts: &[Rc<Module>],
+    poisoned: bool,
+    marker: Option<&crate::keyword::KExpr>,
+    tests: &mut Vec<String>,
+) {
+    let mut names: HashSet<String> = pytestmark.iter().chain(def.marks.iter()).cloned().collect();
+    for candidate in &def.maybe_marks {
+        if let Some(mark) = resolver.resolve_mark_alias(def_module, candidate) {
+            names.insert(mark);
+        }
+    }
+    if let Some(expr) = marker {
+        if !expr.matches_names(&names) {
+            return;
+        }
+    }
+    let mut expansion =
+        if def.expansion != Expansion::None && requests_parametrized_fixture(contexts, &[], def) {
+            Expansion::Fallback
+        } else {
+            def.expansion.clone()
+        };
+    // The anyio plugin parametrizes marked tests with the backend fixture,
+    // adding ID pieces we cannot see.
+    if (poisoned || names.contains("anyio")) && matches!(expansion, Expansion::Params(_)) {
+        expansion = Expansion::Fallback;
+    }
+    tests.extend(expansion.apply(id_name));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1995,37 +2356,86 @@ fn emit_class(
     stack: &mut Vec<String>,
     out: &mut Vec<String>,
 ) {
-    let mut visited = HashSet::new();
     let key = (module.path.clone(), name.to_string());
-    let (methods, unittest, base_params, chain_fixtures, chain_marks) =
-        resolver.resolve_class(module, class, key, &mut visited);
-    // The class chain's parametrized autouse fixtures poison exact
-    // expansion for all of its methods.
-    let poisoned = poisoned || base_params || has_autouse_params(&chain_fixtures);
-
-    let collectable = unittest || (resolver.config.class_matches(name) && !class.has_ctor);
+    let resolved = resolver.resolve_class(module, class, key);
+    // `__test__ = False` (own or inherited) empties the class, unittest or
+    // not; `__test__ = True` collects a class whatever its name.
+    if resolved.dunder_test == Some(false) {
+        return;
+    }
+    let unittest = resolved.unittest;
+    let collectable = unittest
+        || ((resolver.config.class_matches(name) || resolved.dunder_test == Some(true))
+            && !resolved.has_ctor);
     if !collectable {
         return;
     }
+    // The class chain's parametrized autouse fixtures poison exact
+    // expansion for all of its methods.
+    let poisoned = poisoned || resolved.base_params || has_autouse_params(&resolved.fixtures);
+
+    let mut items: Vec<&ResolvedItem> = resolved.items.iter().collect();
+    if unittest {
+        // unittest's TestLoader.getTestCaseNames: every callable attribute
+        // starting with "test", sorted by name. Nested classes are callable
+        // attributes too, never collectors of their own.
+        items.retain(|item| item_name(item).starts_with("test"));
+        items.sort_by(|a, b| item_name(a).cmp(item_name(b)));
+    }
 
     stack.push(name.to_string());
-    let class_expansion = if base_params {
+    let class_expansion = if resolved.base_params {
         Expansion::Fallback
     } else {
         class.expansion.clone()
     };
-    for def in &methods {
-        let matches = if unittest {
-            def.name.starts_with("test")
-        } else {
-            resolver.config.function_matches(&def.name)
+    for item in items {
+        let def = match item {
+            ResolvedItem::Method(def) => def,
+            ResolvedItem::Nested {
+                module: nested_mod,
+                owner,
+                name: nested_name,
+            } => {
+                if unittest {
+                    if class_marks_match(pytestmark, &resolved.marks, marker) {
+                        out.push(format!("{}::{}", stack.join("::"), nested_name));
+                    }
+                    continue;
+                }
+                let owner_class = match owner {
+                    None => Some(class),
+                    Some(owner) => nested_mod.classes.get(owner),
+                };
+                let nested = owner_class.and_then(|c| {
+                    c.items.iter().find_map(|i| match i {
+                        ClassItem::Nested(n, nested) if n == nested_name => Some(nested),
+                        _ => None,
+                    })
+                });
+                if let Some(nested) = nested {
+                    emit_class(
+                        resolver,
+                        nested_mod,
+                        nested,
+                        nested_name,
+                        contexts,
+                        pytestmark,
+                        poisoned,
+                        marker,
+                        stack,
+                        out,
+                    );
+                }
+                continue;
+            }
         };
-        if !matches {
+        if def.not_test || (!unittest && !resolver.config.function_matches(&def.name)) {
             continue;
         }
         let mut names: HashSet<String> = pytestmark
             .iter()
-            .chain(chain_marks.iter())
+            .chain(resolved.marks.iter())
             .chain(def.marks.iter())
             .cloned()
             .collect();
@@ -2049,7 +2459,7 @@ fn emit_class(
             request.args.extend(class.usefixtures.iter().cloned());
             if poisoned
                 || names.contains("anyio")
-                || requests_parametrized_fixture(contexts, &[&chain_fixtures], &request)
+                || requests_parametrized_fixture(contexts, &[&resolved.fixtures], &request)
             {
                 combined = Expansion::Fallback;
             }
@@ -2058,23 +2468,88 @@ fn emit_class(
             out.push(format!("{}::{}", stack.join("::"), id));
         }
     }
-    for item in &class.items {
-        if let ClassItem::Nested(nested_name, nested_class) = item {
-            emit_class(
-                resolver,
-                module,
-                nested_class,
-                nested_name,
-                contexts,
-                pytestmark,
-                poisoned,
-                marker,
-                stack,
-                out,
-            );
+    stack.pop();
+}
+
+fn item_name(item: &ResolvedItem) -> &str {
+    match item {
+        ResolvedItem::Method(def) => def.name.as_str(),
+        ResolvedItem::Nested { name, .. } => name.as_str(),
+    }
+}
+
+fn class_marks_match(
+    pytestmark: &[String],
+    class_marks: &[String],
+    marker: Option<&crate::keyword::KExpr>,
+) -> bool {
+    let Some(expr) = marker else {
+        return true;
+    };
+    let names: HashSet<String> = pytestmark.iter().chain(class_marks).cloned().collect();
+    expr.matches_names(&names)
+}
+
+/// pytest's `pytest_ignore_collect` for conftest `collect_ignore` /
+/// `collect_ignore_glob`, applied to the file and every directory between
+/// it and the rootdir (pytest checks each path as its walk reaches it). For
+/// a path, only the NEAREST conftest at or above its parent that defines
+/// the list counts; entries are relative to that conftest's directory.
+/// Plain entries match a path exactly (so a directory entry prunes the
+/// whole subtree); glob entries use fnmatch, where `*` crosses `/`.
+fn is_collect_ignored(resolver: &mut Resolver, file: &Path) -> bool {
+    let rootdir = resolver.config.rootdir.clone();
+    let mut current = Some(file);
+    while let Some(path) = current {
+        if path == rootdir || !path.starts_with(&rootdir) {
+            break;
+        }
+        let Some(parent) = path.parent() else {
+            break;
+        };
+        let chain = resolver.conftest_chain(parent);
+        if let Some(conftest) = chain.iter().find(|c| c.collect_ignore.is_some()) {
+            let entries = conftest.collect_ignore.as_deref().unwrap_or_default();
+            if entries
+                .iter()
+                .any(|e| normalize_path(&conftest.dir.join(e)) == path)
+            {
+                return true;
+            }
+        }
+        if let Some(conftest) = chain.iter().find(|c| c.collect_ignore_glob.is_some()) {
+            let patterns = conftest.collect_ignore_glob.as_deref().unwrap_or_default();
+            for pattern in patterns {
+                let full = normalize_path(&conftest.dir.join(pattern));
+                let matched = globset::GlobBuilder::new(&full.to_string_lossy())
+                    .literal_separator(false)
+                    .backslash_escape(false)
+                    .build()
+                    .map(|g| g.compile_matcher().is_match(path))
+                    .unwrap_or(false);
+                if matched {
+                    return true;
+                }
+            }
+        }
+        current = Some(parent);
+    }
+    false
+}
+
+/// Lexical `os.path.abspath`-style normalization of `.` and `..`.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
         }
     }
-    stack.pop();
+    out
 }
 
 /// rootdir-relative, forward-slash display path (pytest's node ID prefix).
@@ -2165,9 +2640,10 @@ class LegacySuite(unittest.TestCase):
         let tests = collect_source(source, &test_config());
         assert_eq!(
             tests,
+            // pytest yields inherited members first (reverse MRO order).
             vec![
-                "TestChild::test_own",
                 "TestChild::test_from_base",
+                "TestChild::test_own",
                 "LegacySuite::test_unittest_style",
             ]
         );

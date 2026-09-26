@@ -129,3 +129,60 @@ fn configured_tree_honors_pytest_ini() {
     expected.sort();
     assert_eq!(ids, expected);
 }
+
+/// Collection-semantics edge cases, pinned IN ORDER against
+/// `pytest --collect-only -q` (pytest 9.0.3): `__test__` switches, inherited
+/// constructors, conftest collect_ignore directories / nearest-conftest
+/// shadowing / fnmatch globs, static elif chains, and pytest's ordering
+/// rules — module and class namespaces are dicts (a redefinition keeps its
+/// first slot, `del` frees it, imports sit where the import is), classes
+/// yield inherited members first in reverse C3 MRO order with nested
+/// classes interleaved, and unittest methods come sorted by name.
+#[test]
+fn edge_tree_matches_pytest_in_order() {
+    let root = fixture("edge");
+    let config = Config::discover(&root);
+    let files = cito::collector::collect(std::slice::from_ref(&root), &config, None, None);
+    let ids: Vec<String> = files
+        .iter()
+        .flat_map(|file| {
+            file.tests
+                .iter()
+                .map(move |t| format!("{}::{}", file.path, t))
+        })
+        .collect();
+    let expected = [
+        "globbed/test_keep.py::test_keep",
+        "shadowed/test_kept.py::test_kept",
+        "test_classorder.py::TestOuter::test_1",
+        "test_classorder.py::TestOuter::TestInner::test_in",
+        "test_classorder.py::TestOuter::test_2",
+        "test_classorder.py::TestChild::test_base",
+        "test_classorder.py::TestChild::test_child",
+        "test_classorder.py::TestChild::test_overridden",
+        "test_classorder.py::TestDiamond::test_a1",
+        "test_classorder.py::TestDiamond::test_c",
+        "test_classorder.py::TestDiamond::test_m",
+        "test_classorder.py::TestHasInherited::TestInherited::test_i",
+        "test_classorder.py::TestHasInherited::test_h",
+        "test_classorder.py::TestAttrs::test_overridden",
+        "test_classorder.py::TestAttrs::test_lambda",
+        "test_classorder.py::TestAttrs::test_d",
+        "test_classorder.py::UT::test_M",
+        "test_classorder.py::UT::test_a",
+        "test_classorder.py::UT::test_z",
+        "test_ctor.py::TestNoCtor::test_z",
+        "test_dunder.py::TestBackOn::test_base",
+        "test_dunder.py::TestBackOn::test_on",
+        "test_dunder.py::NotNamedLikeATest::test_nose_style",
+        "test_dunder.py::test_fn_on",
+        "test_elif.py::test_first_arm",
+        "test_elif.py::test_live_elif",
+        "test_modorder.py::test_a",
+        "test_modorder.py::test_imported",
+        "test_modorder.py::test_b",
+        "test_modorder.py::test_in_with",
+        "test_modorder.py::test_c",
+    ];
+    assert_eq!(ids, expected);
+}
