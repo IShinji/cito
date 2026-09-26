@@ -25,18 +25,21 @@ change must keep all fixture trees at `OK: node IDs match`.
 For fuzzing and the release gate:
 
 ```bash
-python3 bench/fuzz_gen.py --seed 7 --out /tmp/fuzz && \
+python3 bench/fuzz_gen.py --seed 7 --out /tmp/fuzz --force && \
     python3 scripts/diff_collect.py /tmp/fuzz --python .venv/bin/python
 python3 scripts/validate_repos.py --python <venv>/bin/python --cache /tmp/repos
 ```
 
-`validate_repos.py` clones ~35 real repositories at wheel-matching tags and
-diff-checks each one; it is run before every release.
+`validate_repos.py` clones the 36 real repositories in its `MATRIX` at
+wheel-matching tags and diff-checks each one; it is run before every release.
+Repos that need pytest 9 (e.g. coverage) are skipped unless you also pass
+`--python9 <pytest-9 venv>/bin/python`. The README's 44-suite table adds eight
+suites validated outside the script in their own pinned environments.
 
 ## Before sending a PR
 
 ```bash
-cargo fmt && cargo clippy --release --all-targets && cargo test
+cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
 CI blocks on all three platforms (Linux, macOS, Windows) plus the pytest

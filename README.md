@@ -116,7 +116,8 @@ $ cito daemon status              # start | stop | status
 
 `--warm` keeps pytest workers alive and runs chunks via `pytest.main()` in-process,
 so conftest, fixtures, and plugins keep working; the daemon extends that across CLI
-invocations. Execution always stays inside real CPython — cito partitions node IDs
+invocations. The daemon is Unix-only for now (on Windows, `cito daemon` exits with
+an error; `--warm` works everywhere). Execution always stays inside real CPython — cito partitions node IDs
 (whole files together, like `xdist --dist loadfile`) and hands them to pytest.
 
 ## Compatibility
@@ -132,8 +133,8 @@ pytest's node IDs are the interface, and cito treats them as a contract:
 trees, a generated corpus, and **randomized differential fuzzing** (`bench/fuzz_gen.py`
 builds seeded projects mixing nested classes, cross-module inheritance, re-exports,
 parametrize variants, fixtures, marks, and shadowing; 100 seeds pass locally, three
-run in CI). Before releases, `scripts/validate_repos.py` reruns the whole matrix
-against fresh clones.
+run in CI). Before releases, `scripts/validate_repos.py` re-checks 36 of the suites
+below against fresh clones at wheel-matching tags.
 
 **Differential results** — pytest IDs vs. cito, on a few of the largest and most
 hostile suites:
@@ -198,8 +199,11 @@ Across 44 suites, ~716k node IDs are checked; the vast majority are exact.
 | aiohttp 3.14.1 | 4,364 | 0 | 0 |
 | hypothesis 6.156.1 | 3,647 | 0 | 3 (asyncio wrapper dynamics) |
 
-(`scripts/validate_repos.py` reruns the whole matrix against fresh clones — the
-release gate. sqlalchemy and django are documented out: their suites require
+(`scripts/validate_repos.py` re-checks 36 of these suites against fresh clones at
+wheel-matching tags — the release gate. The other eight — pytest's own suite (checked
+in CI), home-assistant, pandas, flask, rich, and the scikit-learn, scipy, and numpy
+wheels — need their own pinned environments and are validated separately. sqlalchemy
+and django are documented out: their suites require
 project-specific collection-bootstrap plugins that no static tool can see.)
 
 </details>
@@ -319,7 +323,7 @@ compatibility tool). The short version:
 
 ```console
 $ cargo test                                   # unit + fixture-tree integration tests
-$ cargo fmt && cargo clippy --release --all-targets
+$ cargo fmt && cargo clippy --all-targets -- -D warnings
 $ uv run --with pytest scripts/diff_collect.py tests/fixtures/basic
 ```
 
