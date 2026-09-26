@@ -155,7 +155,6 @@ struct Collected {
     files: Vec<collector::FileTests>,
     roots: Vec<PathBuf>,
     config: Config,
-    marker: Option<keyword::KExpr>,
 }
 
 /// CLI `-m` wins over an `-m` inside config addopts (pytest prepends
@@ -207,7 +206,6 @@ fn collect_files(
         files,
         roots,
         config,
-        marker,
     })
 }
 
@@ -253,10 +251,16 @@ fn file_hash(path: &Path) -> Option<String> {
     Some(format!("{:016x}", hasher.finish()))
 }
 
-/// Merge content hashes for the files that just ran into the cache.
-fn write_hashes(config: &Config, updates: &std::collections::HashMap<String, String>) {
+/// Merge content hashes for verified files into the cache and forget the
+/// hashes in `removals`, so those files count as changed next time.
+fn write_hashes(
+    config: &Config,
+    updates: &std::collections::HashMap<String, String>,
+    removals: &std::collections::HashSet<String>,
+) {
     let mut merged = read_hashes(config);
     merged.extend(updates.clone());
+    merged.retain(|path, _| !removals.contains(path));
     let path = hashes_path(config);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -266,11 +270,16 @@ fn write_hashes(config: &Config, updates: &std::collections::HashMap<String, Str
     let _ = std::fs::write(&path, body.join("\n") + "\n");
 }
 
-/// Did `candidate` (rootdir-relative `path::test`) fail last time? Bare
-/// candidates also match their bracketed parametrizations.
+/// Did `candidate` (rootdir-relative `path::test`) fail last time? Entries
+/// are rootdir-relative node IDs. An entry naming a file (a collection
+/// error) or a class covers every test beneath it, and a bare candidate
+/// covers its bracketed parametrizations. Matching respects path
+/// boundaries: `test_a.py::t` never matches `sub/test_a.py::t`.
 fn matches_failure(candidate: &str, entry: &str) -> bool {
     candidate == entry
-        || candidate.ends_with(entry)
+        || candidate
+            .strip_prefix(entry)
+            .is_some_and(|rest| rest.starts_with("::"))
         || entry
             .strip_prefix(candidate)
             .is_some_and(|rest| rest.starts_with('['))
@@ -321,20 +330,16 @@ fn filter_lastfailed(files: &mut [collector::FileTests], previous: &[String]) {
     }
 }
 
-/// Merge this run's failures into the cache: entries belonging to files that
-/// were just rerun are replaced, everything else is preserved.
-fn write_lastfailed(
-    config: &Config,
-    previous: &[String],
-    rerun_files: &[String],
-    new_failed: &[String],
-) {
+/// Merge this run's failures into the cache: entries covering a test that
+/// just ran to completion (`ran`, rootdir-relative node IDs) are replaced by
+/// this run's results; everything else (other files, tests skipped by
+/// --maxfail) is preserved.
+fn write_lastfailed(config: &Config, previous: &[String], ran: &[String], new_failed: &[String]) {
     let mut merged: Vec<String> = previous
         .iter()
         .filter(|entry| {
-            !rerun_files
-                .iter()
-                .any(|path| entry.starts_with(&format!("{path}::")))
+            !ran.iter()
+                .any(|candidate| matches_failure(candidate, entry))
         })
         .cloned()
         .collect();
@@ -414,9 +419,14 @@ pub fn collect(
     ExitCode::SUCCESS
 }
 
-fn print_summary(outcome: &runner::Outcome) {
+fn print_summary(outcome: &runner::Outcome, stdout_reserved: bool) {
+    // With --json, stdout carries only the machine-readable summary.
     for output in &outcome.failure_output {
-        print!("{output}");
+        if stdout_reserved {
+            eprint!("{output}");
+        } else {
+            print!("{output}");
+        }
     }
     eprintln!(
         "cito: {} passed, {} failed, {} skipped across {} chunk(s) ({} failed) in {:.2}s",
@@ -440,6 +450,8 @@ struct RunOptions {
     /// Only run tests impacted by changes since the last run (AST-level:
     /// own file, conftest chain, config, or transitive project imports).
     changed_only: bool,
+    /// `--json`: stdout is reserved for the summary object.
+    json: bool,
 }
 
 /// If any per-chunk coverage files were produced (the runners point
@@ -488,6 +500,7 @@ fn run_once(
     pool: Option<&WarmPool>,
     purge: &[String],
 ) -> runner::Outcome {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| config.rootdir.clone());
     let previous = read_lastfailed(config);
     let stored_hashes = read_hashes(config);
     // Under --changed, impact analysis hashes every file in each test
@@ -496,8 +509,9 @@ fn run_once(
     // hash only the test files themselves (a dep without a recorded
     // baseline counts as changed on the next --changed run — conservative
     // in the safe direction).
+    let mut closures = std::collections::HashMap::new();
     let (changed, current_hashes) = if options.changed_only {
-        let closures = collector::impact_closures(config, &files);
+        closures = collector::impact_closures(config, &files);
         let mut current: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for dep in closures.values().flatten() {
@@ -544,9 +558,24 @@ fn run_once(
         }
     }
     let files = order_files(files, &previous, &changed);
-    let rerun_files: Vec<String> = files
+    // (rootdir-relative path, absolute path, tests) of every file about to
+    // run, for cache bookkeeping once the runners consumed `files`.
+    let scheduled: Vec<(String, String, Vec<String>)> = files
         .iter()
         .filter(|f| !f.tests.is_empty())
+        .map(|f| {
+            (
+                f.path.clone(),
+                f.abs_path.to_string_lossy().into_owned(),
+                f.tests.clone(),
+            )
+        })
+        .collect();
+    // Impacted by a change but filtered out (-k, --lf, selectors): their
+    // closure was not verified, so they must stay "changed".
+    let impacted_unrun: Vec<String> = files
+        .iter()
+        .filter(|f| f.tests.is_empty() && changed.contains(&f.path))
         .map(|f| f.path.clone())
         .collect();
     let total: usize = files.iter().map(|f| f.tests.len()).sum();
@@ -573,6 +602,7 @@ fn run_once(
                 options.maxfail,
                 &options.extra_args,
                 &options.coverage_base,
+                &cwd,
             ) {
                 break 'exec outcome;
             }
@@ -586,6 +616,7 @@ fn run_once(
                 purge,
                 &options.extra_args,
                 Some(&options.coverage_base),
+                &config.rootdir,
             ),
             None => runner::run(
                 files,
@@ -595,10 +626,17 @@ fn run_once(
                 options.maxfail,
                 &options.extra_args,
                 Some(&options.coverage_base),
+                &cwd,
             ),
         }
     };
-    print_summary(&outcome);
+    let mut outcome = outcome;
+    // pytest prints IDs relative to its working directory; the caches and
+    // matching speak rootdir-relative IDs.
+    for id in outcome.failed_ids.iter_mut() {
+        *id = runner::rootdir_relative_id(id, &cwd, &config.rootdir);
+    }
+    print_summary(&outcome, options.json);
     combine_coverage(config, options);
     if outcome.skipped_chunks > 0 {
         eprintln!(
@@ -606,8 +644,64 @@ fn run_once(
             outcome.skipped_chunks
         );
     }
-    write_lastfailed(config, &previous, &rerun_files, &outcome.failed_ids);
-    write_hashes(config, &current_hashes);
+    // A file is verified only when every one of its tests ran and passed.
+    let unverified: std::collections::HashSet<&str> = outcome
+        .unverified
+        .iter()
+        .map(|id| runner::id_file(id))
+        .collect();
+    let failed_files: std::collections::HashSet<&str> = outcome
+        .failed_ids
+        .iter()
+        .map(|id| runner::id_file(id))
+        .collect();
+    let mut ran: Vec<String> = Vec::new();
+    let mut verified: Vec<&str> = Vec::new();
+    let mut dirty: std::collections::HashSet<String> = impacted_unrun.into_iter().collect();
+    for (path, abs, tests) in &scheduled {
+        if unverified.contains(abs.as_str()) {
+            // Partially run at best (--maxfail, crashed chunk): record only
+            // the tests whose chunk completed.
+            let skipped: std::collections::HashSet<&str> = outcome
+                .unverified
+                .iter()
+                .filter(|id| runner::id_file(id) == abs)
+                .filter_map(|id| id.split_once("::").map(|(_, t)| t))
+                .collect();
+            ran.extend(
+                tests
+                    .iter()
+                    .filter(|t| !skipped.contains(t.as_str()))
+                    .map(|t| format!("{path}::{t}")),
+            );
+            dirty.insert(path.clone());
+        } else {
+            ran.extend(tests.iter().map(|t| format!("{path}::{t}")));
+            if failed_files.contains(path.as_str()) {
+                dirty.insert(path.clone());
+            } else {
+                verified.push(path);
+            }
+        }
+    }
+    write_lastfailed(config, &previous, &ran, &outcome.failed_ids);
+    // Hashes record "known good": only verified files contribute (their own
+    // hash, or under --changed their whole dependency closure). Failed or
+    // unverified files forget their own hash so the next --changed run
+    // picks them up again even when nothing else changed.
+    let mut updates: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut record = |dep: &str| {
+        if let Some(hash) = current_hashes.get(dep) {
+            updates.insert(dep.to_string(), hash.clone());
+        }
+    };
+    for path in verified {
+        match closures.get(path) {
+            Some(deps) => deps.iter().for_each(|dep| record(dep)),
+            None => record(path),
+        }
+    }
+    write_hashes(config, &updates, &dirty);
     outcome
 }
 
@@ -629,11 +723,11 @@ pub fn run(
     changed_only: bool,
     use_daemon: bool,
 ) -> ExitCode {
+    let watch_args = (paths.clone(), marker.clone());
     let Collected {
         mut files,
         roots,
         config,
-        marker,
     } = match collect_files(paths, Some(&python), marker, &ignore) {
         Ok(collected) => collected,
         Err(err) => {
@@ -686,9 +780,10 @@ pub fn run(
         coverage_base: config.rootdir.join(".coverage.cito").display().to_string(),
         daemon: use_daemon,
         changed_only,
+        json,
     };
-    let pool =
-        (warm_workers && !use_daemon).then(|| WarmPool::new(&options.python, options.workers));
+    let pool = (warm_workers && !use_daemon)
+        .then(|| WarmPool::new(&options.python, options.workers, Default::default()));
     let collected: usize = files.iter().map(|f| f.tests.len()).sum();
     let outcome = run_once(files, &config, &options, pool.as_ref(), &[]);
     if json {
@@ -704,26 +799,48 @@ pub fn run(
                 "skipped_chunks": outcome.skipped_chunks,
                 "seconds": outcome.seconds,
                 "failed_ids": outcome.failed_ids,
+                "exit_code": exit_code(collected, &outcome),
             })
         );
     }
     if watch {
-        return watch_loop(
-            &config,
-            &roots,
-            &options,
-            pool.as_ref(),
-            kexpr.as_ref(),
-            marker.as_ref(),
-        );
+        let (watch_paths, watch_marker) = watch_args;
+        let recollect = || -> Vec<collector::FileTests> {
+            match collect_files(
+                watch_paths.clone(),
+                Some(&options.python),
+                watch_marker.clone(),
+                &ignore,
+            ) {
+                Ok(collected) => {
+                    let mut files = collected.files;
+                    if let Some(expr) = &kexpr {
+                        apply_keyword(&mut files, expr);
+                    }
+                    files
+                }
+                Err(err) => {
+                    eprintln!("cito: {err}");
+                    Vec::new()
+                }
+            }
+        };
+        return watch_loop(&config, &roots, &options, pool.as_ref(), &recollect);
     }
+    ExitCode::from(exit_code(collected, &outcome))
+}
+
+/// pytest-compatible exit status: 5 when nothing was collected, 0 when
+/// nothing needed running (e.g. `--changed` with no changes), otherwise the
+/// chunks' combined code (1 test failures, 2 interrupted, 3 internal
+/// error, 4 usage error).
+fn exit_code(collected: usize, outcome: &runner::Outcome) -> u8 {
     if collected == 0 {
-        // pytest exit code 5: no tests were collected/ran.
-        ExitCode::from(5)
-    } else if outcome.failed == 0 {
-        ExitCode::SUCCESS
+        5
+    } else if outcome.chunks == 0 {
+        0
     } else {
-        ExitCode::FAILURE
+        u8::try_from(outcome.exit_code).unwrap_or(1)
     }
 }
 
@@ -740,16 +857,66 @@ fn note_event(event: Result<notify::Event, notify::Error>, changed: &mut BTreeSe
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Config files whose change can alter every test's behavior.
+const CONFIG_NAMES: &[&str] = &[
+    "pytest.ini",
+    ".pytest.ini",
+    "pyproject.toml",
+    "tox.ini",
+    "setup.cfg",
+];
+
+/// Forward-slash path of `path` relative to `root` (the `FileTests::path`
+/// convention), if it lies inside it.
+fn root_relative(path: &Path, root: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?;
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    Some(parts.join("/"))
+}
+
+fn is_noise(path: &Path) -> bool {
+    path.components().any(|c| {
+        matches!(
+            c.as_os_str().to_str(),
+            Some(
+                ".git"
+                    | "target"
+                    | ".cito"
+                    | "__pycache__"
+                    | ".pytest_cache"
+                    | ".venv"
+                    | "venv"
+                    | ".tox"
+                    | "node_modules"
+            )
+        )
+    })
+}
+
+/// Rerun whatever a batch of file changes affects: a config change reruns
+/// everything; a `.py` change (test, helper, or conftest) reruns every test
+/// file whose impact closure — the same import graph `--changed` uses —
+/// contains it.
 fn watch_loop(
     config: &Config,
     roots: &[PathBuf],
     options: &RunOptions,
     pool: Option<&WarmPool>,
-    kexpr: Option<&keyword::KExpr>,
-    marker: Option<&keyword::KExpr>,
+    recollect: &dyn Fn() -> Vec<collector::FileTests>,
 ) -> ExitCode {
     use notify::{RecursiveMode, Watcher};
+
+    let root = config
+        .rootdir
+        .canonicalize()
+        .unwrap_or_else(|_| config.rootdir.clone());
+    let config_source = config
+        .source
+        .as_ref()
+        .map(|s| s.canonicalize().unwrap_or_else(|_| s.clone()));
 
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = match notify::recommended_watcher(move |res| {
@@ -761,14 +928,34 @@ fn watch_loop(
             return ExitCode::FAILURE;
         }
     };
-    for root in roots {
-        let target = if root.is_file() {
-            root.parent().unwrap_or(Path::new(".")).to_path_buf()
+    let mut recursive: Vec<PathBuf> = Vec::new();
+    for target in roots {
+        let target = if target.is_file() {
+            target.parent().unwrap_or(Path::new(".")).to_path_buf()
         } else {
-            root.clone()
+            target.clone()
         };
+        let target = target.canonicalize().unwrap_or(target);
         if let Err(err) = watcher.watch(&target, RecursiveMode::Recursive) {
             eprintln!("cito: cannot watch {}: {err}", target.display());
+        }
+        recursive.push(target);
+    }
+    // Helpers and config can live outside the test roots: also watch the
+    // rootdir itself and every directory holding a dependency, shallowly.
+    let mut shallow: BTreeSet<PathBuf> = BTreeSet::new();
+    shallow.insert(root.clone());
+    let initial = recollect();
+    for deps in collector::impact_closures(config, &initial).values() {
+        for dep in deps {
+            if let Some(dir) = root.join(dep).parent() {
+                shallow.insert(dir.to_path_buf());
+            }
+        }
+    }
+    for dir in shallow {
+        if !recursive.iter().any(|r| dir.starts_with(r)) {
+            let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
         }
     }
     eprintln!("cito: watching for changes (Ctrl-C to stop)");
@@ -784,45 +971,61 @@ fn watch_loop(
         while let Ok(more) = rx.recv_timeout(Duration::from_millis(250)) {
             note_event(more, &mut changed);
         }
+        // Judge noise below the rootdir only: a project may itself live
+        // under a directory called `target` or `venv`.
+        let changed: Vec<PathBuf> = changed
+            .into_iter()
+            .filter(|p| !is_noise(p.strip_prefix(&root).unwrap_or(p)))
+            .collect();
+        let config_changed = changed.iter().any(|p| {
+            config_source.as_ref() == Some(p)
+                || (p.parent() == Some(root.as_path())
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| CONFIG_NAMES.contains(&n)))
+        });
+        // Deleted modules matter too, so no is_file() filter here.
         let changed_py: Vec<PathBuf> = changed
             .into_iter()
-            .filter(|p| p.is_file())
-            .filter(|p| p.extension().is_some_and(|e| e == "py"))
-            .filter(|p| {
-                !p.components().any(|c| {
-                    matches!(
-                        c.as_os_str().to_str(),
-                        Some(".git") | Some("target") | Some(".cito") | Some("__pycache__")
-                    )
-                })
-            })
+            .filter(|p| p.extension().is_some_and(|e| e == "py") && !p.is_dir())
             .collect();
-        if changed_py.is_empty() {
+        if changed_py.is_empty() && !config_changed {
             continue;
         }
-        // Warm workers must drop cached modules for every changed .py file,
-        // not just test files (support modules go stale too).
+        // Warm workers drop every project module once anything changed;
+        // the explicit list also covers files they never imported.
         pending_purge.extend(changed_py.iter().map(|p| p.to_string_lossy().into_owned()));
         pending_purge.sort();
         pending_purge.dedup();
-        let test_files: Vec<PathBuf> = changed_py
-            .into_iter()
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| config.is_test_file(n, config.relative_to_root(p)))
-            })
-            .collect();
-        if test_files.is_empty() {
-            continue;
-        }
-        eprintln!(
-            "cito: change detected in {} test file(s); rerunning",
-            test_files.len()
-        );
-        let mut files = collector::collect(&test_files, config, Some(&options.python), marker);
-        if let Some(expr) = kexpr {
-            apply_keyword(&mut files, expr);
+
+        let mut files = recollect();
+        if config_changed {
+            eprintln!("cito: config changed; rerunning everything");
+        } else {
+            let changed_rel: std::collections::HashSet<String> = changed_py
+                .iter()
+                .filter_map(|p| root_relative(p, &root))
+                .collect();
+            let closures = collector::impact_closures(config, &files);
+            let mut affected = 0usize;
+            for file in files.iter_mut() {
+                let hit = closures
+                    .get(&file.path)
+                    .is_some_and(|deps| deps.iter().any(|d| changed_rel.contains(d)))
+                    || changed_rel.contains(&file.path);
+                if hit {
+                    affected += 1;
+                } else {
+                    file.tests.clear();
+                }
+            }
+            if affected == 0 {
+                continue;
+            }
+            eprintln!(
+                "cito: change detected ({} file(s)); rerunning {affected} affected test file(s)",
+                changed_rel.len()
+            );
         }
         run_once(files, config, options, pool, &pending_purge);
         pending_purge.clear();
@@ -904,11 +1107,27 @@ mod tests {
             "tests/a.py::test_x",
             "tests/a.py::test_x[1]"
         ));
-        // Rootdir mismatch tolerated by suffix matching.
-        assert!(matches_failure(
+        // No suffix matching across path boundaries.
+        assert!(!matches_failure(
             "pkg/tests/a.py::test_x",
             "tests/a.py::test_x"
         ));
+        assert!(!matches_failure(
+            "sub/test_a.py::test_x",
+            "test_a.py::test_x"
+        ));
         assert!(!matches_failure("tests/a.py::test_y", "tests/a.py::test_x"));
+        assert!(!matches_failure(
+            "tests/a.py::test_xy",
+            "tests/a.py::test_x"
+        ));
+        // File-level (collection error) and class-level entries cover
+        // everything beneath them.
+        assert!(matches_failure("tests/bad.py::test_a", "tests/bad.py"));
+        assert!(matches_failure(
+            "tests/a.py::TestK::test_y",
+            "tests/a.py::TestK"
+        ));
+        assert!(!matches_failure("tests/bad.py2::test_a", "tests/bad.py"));
     }
 }

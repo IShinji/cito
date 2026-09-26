@@ -136,6 +136,7 @@ dependencies = [
  "clap",
  "globset",
  "ignore",
+ "libc",
  "notify",
  "num_cpus",
  "rayon",

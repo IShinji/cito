@@ -3,6 +3,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+/// python.org Windows installs ship `python.exe` (plus the `py` launcher)
+/// but no `python3`.
+const DEFAULT_PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
+
 #[derive(Parser)]
 #[command(
     name = "cito",
@@ -51,8 +55,10 @@ enum Command {
         /// Maximum node IDs per pytest invocation.
         #[arg(long, default_value_t = 256)]
         chunk: usize,
-        /// Python executable used to run pytest.
-        #[arg(long, default_value = "python3")]
+        /// Python executable used to run pytest, resolved on PATH like a
+        /// shell would (so an activated virtualenv wins). Defaults to
+        /// `python3`, or `python` on Windows.
+        #[arg(long, default_value = DEFAULT_PYTHON)]
         python: String,
         /// Keep pytest workers warm across chunks (v0.2 preview): each worker
         /// imports pytest once and runs chunks in-process.

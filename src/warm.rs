@@ -1,22 +1,40 @@
-use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
 
 use serde::Deserialize;
 
 use crate::collector::FileTests;
-use crate::runner::{make_chunks, report_chunk, ChunkReport, Counts, Outcome};
+use crate::runner::{make_chunks, report_chunk, schedule, ChunkReport, Outcome};
 
 /// Each worker imports pytest once and then runs `pytest.main()` per chunk
 /// in-process, killing the interpreter+import startup tax that the
 /// subprocess runner pays per chunk. Execution stays inside real CPython, so
-/// conftest, fixtures, and plugins keep working. A `purge` list of absolute
-/// file paths evicts stale modules before running — required when the pool
-/// outlives file edits (watch mode).
+/// conftest, fixtures, and plugins keep working.
+///
+/// Freshness: before each chunk the worker checks the mtimes of every
+/// module it has imported (plus the explicit `purge` list of changed files
+/// from watch mode). If anything changed, every project-local module (file
+/// under the request's `root`, excluding virtualenvs/site-packages) is
+/// evicted from `sys.modules`, so dependents re-import instead of keeping
+/// stale `from helper import f` bindings.
+///
+/// Protocol: requests and replies travel over private duplicates of the
+/// original stdin/stdout. fd 0 is then pointed at /dev/null and fd 1 at
+/// stderr, so tests that write to the real file descriptors (`os.system`,
+/// subprocesses under `-s`) or read stdin cannot corrupt the stream.
 const WORKER_SHIM: &str = r#"
 import contextlib, importlib, io, json, os, sys
+
+_req = os.fdopen(os.dup(0), "r", encoding="utf-8")
+_rep = os.fdopen(os.dup(1), "w", encoding="utf-8")
+_null = os.open(os.devnull, os.O_RDONLY)
+os.dup2(_null, 0)
+os.close(_null)
+os.dup2(2, 1)
+
 import pytest
 
 _mtimes = {}
@@ -27,53 +45,101 @@ def _remember():
         if f and f not in _mtimes:
             try:
                 _mtimes[f] = os.stat(f).st_mtime_ns
-            except OSError:
+            except (OSError, TypeError, ValueError):
                 pass
 
-def _purge(targets):
-    stale = set(targets)
+def _real(path):
+    try:
+        return os.path.realpath(path)
+    except (OSError, TypeError, ValueError):
+        return None
+
+def _under(path, root):
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+def _project_local(f, root, excluded):
+    f = _real(f)
+    if not f or not root or not _under(f, root):
+        return False
+    parts = f.split(os.sep)
+    if "site-packages" in parts or "dist-packages" in parts:
+        return False
+    return not any(_under(f, p) for p in excluded)
+
+def _purge(targets, root):
+    stale = {p for p in (_real(t) for t in targets) if p}
     for f, recorded in list(_mtimes.items()):
         try:
             current = os.stat(f).st_mtime_ns
         except OSError:
             current = None
         if current != recorded:
-            stale.add(f)
+            stale.add(_real(f) or f)
             del _mtimes[f]
     if not stale:
         return
+    root = _real(root) if root else None
+    # Interpreter prefixes inside the project (./.venv) are not project code.
+    excluded = set()
+    if root:
+        for p in {sys.prefix, sys.base_prefix, sys.exec_prefix}:
+            p = _real(p)
+            if p and p != root and _under(p, root):
+                excluded.add(p)
     for name, mod in list(sys.modules.items()):
         try:
-            if getattr(mod, "__file__", None) in stale:
+            f = getattr(mod, "__file__", None)
+            if not f:
+                continue
+            if _project_local(f, root, excluded) or _real(f) in stale:
                 del sys.modules[name]
+                _mtimes.pop(f, None)
         except Exception:
             pass
+    sys.path_importer_cache.clear()
     importlib.invalidate_caches()
 
-for line in sys.stdin:
+for line in _req:
     req = json.loads(line)
     for key, value in (req.get("env") or {}).items():
         os.environ[key] = value
-    _purge(req.get("purge") or ())
+    _purge(req.get("purge") or (), req.get("root"))
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         try:
             code = int(pytest.main(req["args"]))
         except SystemExit as exc:
-            code = int(exc.code or 0)
+            # Mirror the interpreter: None -> 0, int -> itself, anything
+            # else is printed and exits 1.
+            if exc.code is None:
+                code = 0
+            elif isinstance(exc.code, int):
+                code = exc.code
+            else:
+                print(exc.code, file=sys.stderr)
+                code = 1
         except BaseException:
             import traceback
             traceback.print_exc()
             code = 3
     _remember()
-    sys.stdout.write(json.dumps({"code": code, "output": buf.getvalue()}) + "\n")
-    sys.stdout.flush()
+    _rep.write(json.dumps({"code": code, "output": buf.getvalue()}) + "\n")
+    _rep.flush()
 "#;
 
 #[derive(Deserialize)]
 struct Reply {
     code: i32,
     output: String,
+}
+
+/// How pool workers are launched: working directory and (optionally) a
+/// complete replacement environment. The daemon uses this to make workers
+/// match the client that asked for them.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct SpawnSpec {
+    pub cwd: Option<PathBuf>,
+    pub env: Option<Vec<(String, String)>>,
 }
 
 struct Worker {
@@ -83,17 +149,24 @@ struct Worker {
 }
 
 impl Worker {
-    fn spawn(python: &str) -> Option<Worker> {
-        let mut child = Command::new(python)
+    fn spawn(python: &str, spec: &SpawnSpec) -> Result<Worker, String> {
+        let mut command = Command::new(python);
+        command
             .args(["-c", WORKER_SHIM])
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::piped());
+        if let Some(cwd) = &spec.cwd {
+            command.current_dir(cwd);
+        }
+        if let Some(env) = &spec.env {
+            command.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        }
+        let mut child = command
             .spawn()
-            .map_err(|err| eprintln!("cito: failed to spawn {python}: {err}"))
-            .ok()?;
+            .map_err(|err| format!("cito: failed to spawn {python}: {err}\n"))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-        Some(Worker {
+        Ok(Worker {
             child,
             stdin,
             stdout,
@@ -106,9 +179,16 @@ impl Worker {
         args: &[String],
         purge: &[String],
         env: &serde_json::Value,
+        root: &Path,
     ) -> Option<Reply> {
-        let request = serde_json::json!({ "args": args, "purge": purge, "env": env });
+        let request = serde_json::json!({
+            "args": args,
+            "purge": purge,
+            "env": env,
+            "root": root.to_string_lossy(),
+        });
         writeln!(self.stdin, "{request}").ok()?;
+        self.stdin.flush().ok()?;
         let mut line = String::new();
         match self.stdout.read_line(&mut line) {
             Ok(n) if n > 0 => serde_json::from_str(&line)
@@ -127,20 +207,34 @@ impl Drop for Worker {
 }
 
 /// A pool of warm pytest workers that can outlive a single run (watch mode
-/// reuses it across iterations, passing changed files as `purge`).
+/// and the daemon reuse it; workers re-check module freshness per chunk).
 pub struct WarmPool {
     python: String,
+    spec: SpawnSpec,
+    /// Where workers run; pytest reports node IDs relative to it.
+    cwd: PathBuf,
     workers: Vec<Mutex<Option<Worker>>>,
 }
 
 impl WarmPool {
-    pub fn new(python: &str, size: usize) -> WarmPool {
+    pub fn new(python: &str, size: usize, spec: SpawnSpec) -> WarmPool {
+        let cwd = spec
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
         WarmPool {
             python: python.to_string(),
+            spec,
+            cwd,
             workers: (0..size.max(1)).map(|_| Mutex::new(None)).collect(),
         }
     }
 
+    /// Run `files`; `root` is the project rootdir (modules under it are
+    /// evicted when anything changed), `purge` lists files known to have
+    /// changed since the pool last ran.
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
         files: Vec<FileTests>,
@@ -149,101 +243,59 @@ impl WarmPool {
         purge: &[String],
         extra_args: &[String],
         coverage_base: Option<&str>,
+        root: &Path,
     ) -> Outcome {
-        let chunks = make_chunks(&files, chunk_size);
-        let total = chunks.len();
-        let queue = Mutex::new(VecDeque::from(chunks));
-        let failed = Mutex::new(0usize);
-        let skipped = Mutex::new(0usize);
-        let totals = Mutex::new(Counts::default());
-        let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        let outputs: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        let chunk_seq = std::sync::atomic::AtomicUsize::new(0);
-        let start = Instant::now();
-        std::thread::scope(|scope| {
-            for slot in &self.workers {
-                scope.spawn(|| {
-                    let mut slot = slot.lock().expect("worker slot");
-                    loop {
-                        let Some(ids) = queue.lock().expect("queue lock").pop_front() else {
-                            break;
-                        };
-                        if slot.is_none() {
-                            *slot = Worker::spawn(&self.python);
-                        }
-                        let Some(worker) = slot.as_mut() else {
-                            *failed.lock().expect("failed lock") += 1;
-                            continue;
-                        };
-                        let mut args = vec![
-                            "-q".to_string(),
-                            "--no-header".to_string(),
-                            "-rfE".to_string(),
-                        ];
-                        args.extend(extra_args.iter().cloned());
-                        args.extend(ids);
-                        let env = match coverage_base {
-                            Some(base) => {
-                                let seq =
-                                    chunk_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                serde_json::json!({ "COVERAGE_FILE": format!("{base}.{seq}") })
-                            }
-                            None => serde_json::Value::Null,
-                        };
-                        let report = match worker.run_chunk(&args, purge, &env) {
-                            Some(reply) => report_chunk(Some(reply.code), &reply.output, ""),
-                            None => {
-                                *slot = None;
-                                ChunkReport {
-                                    failed: true,
-                                    counts: Counts::default(),
-                                    failed_ids: Vec::new(),
-                                    output: Some(
-                                        "cito: pytest worker died; its chunk is marked failed\n"
-                                            .to_string(),
-                                    ),
-                                }
-                            }
-                        };
-                        {
-                            let mut totals = totals.lock().expect("totals lock");
-                            totals.add(report.counts);
-                            if report.failed {
-                                *failed.lock().expect("failed lock") += 1;
-                            }
-                            if maxfail > 0 && totals.failed as usize >= maxfail {
-                                let mut queue = queue.lock().expect("queue lock");
-                                *skipped.lock().expect("skipped lock") += queue.len();
-                                queue.clear();
-                            }
-                        }
-                        failures
-                            .lock()
-                            .expect("failures lock")
-                            .extend(report.failed_ids);
-                        if let Some(output) = report.output {
-                            outputs.lock().expect("outputs lock").push(output);
-                        }
-                    }
-                });
-            }
-        });
-
-        // Chunks left behind by dead workers count as failures, not silence.
-        let leftover = queue.into_inner().expect("queue lock").len();
-        let failed = *failed.lock().expect("failed lock") + leftover;
-        let skipped_chunks = *skipped.lock().expect("skipped lock");
-        let counts = *totals.lock().expect("totals lock");
-        let failed_ids = failures.into_inner().expect("failures lock");
-        let failure_output = outputs.into_inner().expect("outputs lock");
-        Outcome {
-            chunks: total,
-            failed,
-            skipped_chunks,
-            seconds: start.elapsed().as_secs_f64(),
-            counts,
-            failed_ids,
-            failure_output,
+        struct Slot<'a> {
+            worker: &'a Mutex<Option<Worker>>,
+            /// The purge list only needs delivering once per worker per run.
+            purged: bool,
         }
+        let chunks = make_chunks(&files, chunk_size);
+        let chunk_seq = AtomicUsize::new(0);
+        let exec = |state: &mut Slot, ids: &[String]| -> ChunkReport {
+            let mut slot = state.worker.lock().expect("worker slot");
+            if slot.is_none() {
+                match Worker::spawn(&self.python, &self.spec) {
+                    Ok(worker) => *slot = Some(worker),
+                    Err(message) => return ChunkReport::crashed(message),
+                }
+            }
+            let worker = slot.as_mut().expect("worker just ensured");
+            let mut args = vec![
+                "-q".to_string(),
+                "--no-header".to_string(),
+                "-rfE".to_string(),
+            ];
+            args.extend(extra_args.iter().cloned());
+            args.extend(ids.iter().cloned());
+            let env = match coverage_base {
+                Some(base) => {
+                    let seq = chunk_seq.fetch_add(1, Ordering::Relaxed);
+                    serde_json::json!({ "COVERAGE_FILE": format!("{base}.{seq}") })
+                }
+                None => serde_json::Value::Null,
+            };
+            let purge_now = if state.purged { &[][..] } else { purge };
+            state.purged = true;
+            match worker.run_chunk(&args, purge_now, &env, root) {
+                Some(reply) => report_chunk(Some(reply.code), &reply.output, ""),
+                None => {
+                    // Dead or desynchronized: drop (kills) and respawn later.
+                    *slot = None;
+                    ChunkReport::crashed(
+                        "cito: pytest worker died; its chunk is marked failed\n".to_string(),
+                    )
+                }
+            }
+        };
+        let states = self
+            .workers
+            .iter()
+            .map(|worker| Slot {
+                worker,
+                purged: false,
+            })
+            .collect();
+        schedule(chunks, states, maxfail, &self.cwd, &exec)
     }
 }
